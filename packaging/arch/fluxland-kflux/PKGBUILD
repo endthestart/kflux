@@ -37,7 +37,7 @@ sha256sums=('SKIP' 'SKIP')
 prepare() {
   cd "fluxland-${_commit}"
   patch -Np1 -i "../kflux-${_kfluxver}/third_party/patches/fluxland-wlroots-0.20.patch"
-  # The unit tests stub wlroots 0.18's API and are not part of the package.
+  # The unit tests are not part of the package; don't build them.
   sed -i "s/^subdir('tests')/# &/" meson.build
 }
 

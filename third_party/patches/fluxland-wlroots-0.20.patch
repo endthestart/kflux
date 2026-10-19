@@ -1,6 +1,6 @@
 fluxland: port from wlroots 0.18 to wlroots 0.20 (for kflux)
 
-Applies to ecliptik/fluxland 32d1009 (v1.1.0). Same content as the eight commits
+Applies to ecliptik/fluxland 32d1009 (v1.1.0). Same content as the ten commits
 on branch wlroots-0.20 in third_party/fluxland (see docs/upstream/fluxland-pr.md).
 
 Build:
@@ -33,9 +33,11 @@ Fluxbox behaviour fixes found while testing in kflux (not wlroots related):
 - toolbar.tools: accept Fluxbox's comma-separated list, not only spaces.
 - Icon bar: leave out windows docked in the slit.
 
-Tests: test_rules stubbed the removed geometry getter; set the field instead.
-test_toolbar_layout's wm_view stub gains `docked`.
-The other unit tests stub wlroots 0.18's API and are not ported.
+Tests: the unit tests that stub wlroots now use the 0.20 shapes (geometry field,
+presentation version, tablet argument order, per-axis maximize, renamed
+signals), test_decoration_logic covers the deferred decoration mode, and
+test_ipc_server (include path) and test_perf (feature macro) build again.
+`meson test`: 53 of 53 pass.
 
 diff --git a/meson.build b/meson.build
 index 0ce5055..9914b78 100644
@@ -567,6 +569,318 @@ index 16eedd9..03eba79 100644
  
  # --- test_config: config parser tests ---
  test_config = executable(
+diff --git a/tests/test_cursor_snap.c b/tests/test_cursor_snap.c
+index 92c4db4..e55d9b7 100644
+--- a/tests/test_cursor_snap.c
++++ b/tests/test_cursor_snap.c
+@@ -1232,15 +1232,6 @@ wlr_xdg_toplevel_send_close(struct wlr_xdg_toplevel *toplevel)
+ 	(void)toplevel;
+ }
+ 
+-static void
+-wlr_xdg_surface_get_geometry(struct wlr_xdg_surface *surface,
+-	struct wlr_box *box)
+-{
+-	(void)surface;
+-	box->x = 0; box->y = 0;
+-	box->width = 800; box->height = 600;
+-}
+-
+ static void
+ wlr_seat_pointer_notify_enter(struct wlr_seat *seat,
+ 	struct wlr_surface *surf, double sx, double sy)
+diff --git a/tests/test_decoration_logic.c b/tests/test_decoration_logic.c
+index 1aecfbc..914999f 100644
+--- a/tests/test_decoration_logic.c
++++ b/tests/test_decoration_logic.c
+@@ -156,10 +156,15 @@ struct wlr_box {
+ 
+ struct wlr_surface {
+ 	int dummy;
++	struct {
++		struct wl_signal commit;
++	} events;
+ };
+ 
+ struct wlr_xdg_surface {
+ 	struct wlr_surface *surface;
++	struct wlr_box geometry;
++	bool initialized;
+ };
+ 
+ struct wlr_xdg_toplevel {
+@@ -168,6 +173,7 @@ struct wlr_xdg_toplevel {
+ };
+ 
+ struct wlr_xdg_toplevel_decoration_v1 {
++	struct wlr_xdg_toplevel *toplevel;
+ 	struct {
+ 		struct wl_signal destroy;
+ 		struct wl_signal request_mode;
+@@ -476,16 +482,6 @@ wlr_scene_tree_from_node(struct wlr_scene_node *node)
+ 	return (struct wlr_scene_tree *)node;
+ }
+ 
+-static void wlr_xdg_surface_get_geometry(struct wlr_xdg_surface *surface,
+-	struct wlr_box *box)
+-{
+-	(void)surface;
+-	box->x = 0;
+-	box->y = 0;
+-	box->width = 800;
+-	box->height = 600;
+-}
+-
+ static uint32_t wlr_xdg_toplevel_set_size(struct wlr_xdg_toplevel *tl,
+ 	int w, int h)
+ {
+@@ -493,15 +489,23 @@ static uint32_t wlr_xdg_toplevel_set_size(struct wlr_xdg_toplevel *tl,
+ 	return 0;
+ }
+ 
++static struct wl_listener *g_last_added_listener;
++
+ static void wl_signal_add(struct wl_signal *signal, struct wl_listener *listener)
+ {
+-	(void)signal; (void)listener;
++	(void)signal;
++	g_last_added_listener = listener;
+ }
+ 
++static int g_set_mode_count;
++static int g_last_mode;
++
+ static void wlr_xdg_toplevel_decoration_v1_set_mode(
+ 	struct wlr_xdg_toplevel_decoration_v1 *deco, int mode)
+ {
+-	(void)deco; (void)mode;
++	(void)deco;
++	g_set_mode_count++;
++	g_last_mode = mode;
+ }
+ 
+ static struct wlr_xdg_decoration_manager_v1 *
+@@ -675,6 +679,8 @@ setup(void)
+ 	test_server.style = &test_style;
+ 
+ 	test_xdg_surface.surface = &test_surface;
++	test_xdg_surface.geometry = (struct wlr_box){ 0, 0, 800, 600 };
++	test_xdg_surface.initialized = true;
+ 	test_toplevel.base = &test_xdg_surface;
+ 	test_toplevel.width = 800;
+ 	test_toplevel.height = 600;
+@@ -3282,8 +3288,10 @@ test_xdg_decoration_init_error(void)
+ static void
+ test_xdg_decoration_request_mode_handler(void)
+ {
++	setup();
+ 	struct wlr_xdg_toplevel_decoration_v1 wlr_deco;
+ 	memset(&wlr_deco, 0, sizeof(wlr_deco));
++	wlr_deco.toplevel = &test_toplevel;
+ 
+ 	struct wm_xdg_decoration *deco = calloc(1, sizeof(*deco));
+ 	assert(deco != NULL);
+@@ -3291,14 +3299,60 @@ test_xdg_decoration_request_mode_handler(void)
+ 	deco->server = &test_server;
+ 	wl_list_init(&deco->destroy.link);
+ 	wl_list_init(&deco->request_mode.link);
++	wl_list_init(&deco->surface_commit.link);
++
++	/* Initialized toplevel: the request sets server-side mode */
++	g_set_mode_count = 0;
++	handle_xdg_decoration_request_mode(&deco->request_mode, NULL);
++	assert(g_set_mode_count == 1);
++	assert(g_last_mode == WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+ 
+-	/* Call request_mode handler — should set server-side mode (stub no-op) */
++	/* Before the initial commit, no configure may be sent */
++	test_xdg_surface.initialized = false;
+ 	handle_xdg_decoration_request_mode(&deco->request_mode, NULL);
++	assert(g_set_mode_count == 1);
+ 
+ 	free(deco);
+ 	printf("  PASS: xdg_decoration_request_mode_handler\n");
+ }
+ 
++/* --- xdg decoration created before the initial commit --- */
++
++static void
++test_xdg_decoration_mode_deferred_to_commit(void)
++{
++	setup();
++	test_xdg_surface.initialized = false;
++	struct wlr_xdg_toplevel_decoration_v1 wlr_deco;
++	memset(&wlr_deco, 0, sizeof(wlr_deco));
++	wlr_deco.toplevel = &test_toplevel;
++
++	/* Created before the initial commit: no mode yet, wait for commit */
++	g_set_mode_count = 0;
++	g_last_added_listener = NULL;
++	handle_new_xdg_decoration(&test_server.new_xdg_decoration, &wlr_deco);
++	assert(g_set_mode_count == 0);
++	struct wl_listener *commit = g_last_added_listener;
++	assert(commit != NULL);
++	assert(commit->notify == handle_xdg_decoration_surface_commit);
++	wl_list_init(&commit->link);
++
++	/* A commit that leaves the toplevel uninitialized keeps waiting */
++	commit->notify(commit, NULL);
++	assert(g_set_mode_count == 0);
++
++	/* The initial commit sets server-side mode */
++	test_xdg_surface.initialized = true;
++	commit->notify(commit, NULL);
++	assert(g_set_mode_count == 1);
++	assert(g_last_mode == WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
++
++	struct wm_xdg_decoration *deco =
++		wl_container_of(commit, deco, surface_commit);
++	free(deco);
++	printf("  PASS: xdg_decoration_mode_deferred_to_commit\n");
++}
++
+ /* --- xdg decoration destroy handler --- */
+ 
+ static void
+@@ -3314,6 +3368,7 @@ test_xdg_decoration_destroy_handler(void)
+ 	/* Must init links so wl_list_remove doesn't crash */
+ 	wl_list_init(&deco->destroy.link);
+ 	wl_list_init(&deco->request_mode.link);
++	wl_list_init(&deco->surface_commit.link);
+ 
+ 	/* Destroy handler frees deco */
+ 	handle_xdg_decoration_destroy(&deco->destroy, NULL);
+@@ -3865,6 +3920,7 @@ main(void)
+ 	/* xdg decoration protocol */
+ 	test_xdg_decoration_init_error();
+ 	test_xdg_decoration_request_mode_handler();
++	test_xdg_decoration_mode_deferred_to_commit();
+ 	test_xdg_decoration_destroy_handler();
+ 
+ 	/* additional coverage: render functions */
+diff --git a/tests/test_ipc_server.c b/tests/test_ipc_server.c
+index 7f4e846..30af4d4 100644
+--- a/tests/test_ipc_server.c
++++ b/tests/test_ipc_server.c
+@@ -257,7 +257,7 @@ read_pipe_contents(size_t *out_len)
+ 
+ /* --- Include ipc.c source directly --- */
+ 
+-#include "../../src/ipc.c"
++#include "../src/ipc.c"
+ 
+ /* --- Test helpers --- */
+ 
+diff --git a/tests/test_perf.c b/tests/test_perf.c
+index 28b9b90..1a6420a 100644
+--- a/tests/test_perf.c
++++ b/tests/test_perf.c
+@@ -5,6 +5,9 @@
+  * test_perf.c - Performance profiling infrastructure tests
+  */
+ 
++/* clock_gettime() and CLOCK_MONOTONIC, used by perf.h */
++#define _POSIX_C_SOURCE 200809L
++
+ #include <assert.h>
+ #include <stdio.h>
+ #include <string.h>
+diff --git a/tests/test_placement.c b/tests/test_placement.c
+index 2ee6d39..850f1ce 100644
+--- a/tests/test_placement.c
++++ b/tests/test_placement.c
+@@ -98,6 +98,7 @@ struct wlr_scene_tree {
+ 
+ struct wlr_xdg_surface {
+ 	struct wlr_surface *surface;
++	struct wlr_box geometry;
+ };
+ 
+ struct wlr_xdg_toplevel {
+@@ -190,7 +191,7 @@ struct wm_view {
+ 
+ static int g_set_size_count;
+ static int g_set_position_count;
+-static struct wlr_box g_stub_xdg_geo; /* geometry returned by stub */
++static struct wlr_box g_stub_xdg_geo; /* window geometry of every test view */
+ 
+ /* Output returned by wlr_output_layout_output_at */
+ static struct wlr_output *g_output_at_result;
+@@ -221,14 +222,6 @@ wlr_output_layout_get_box(struct wlr_output_layout *layout,
+ 	*box = g_layout_box;
+ }
+ 
+-static void
+-wlr_xdg_surface_get_geometry(struct wlr_xdg_surface *surface,
+-	struct wlr_box *box)
+-{
+-	(void)surface;
+-	*box = g_stub_xdg_geo;
+-}
+-
+ static uint32_t
+ wlr_xdg_toplevel_set_size(struct wlr_xdg_toplevel *toplevel,
+ 	int width, int height)
+@@ -307,6 +300,15 @@ static struct wlr_scene_tree test_trees[MAX_TEST_VIEWS];
+ static struct wlr_xdg_toplevel test_toplevels[MAX_TEST_VIEWS];
+ static struct wlr_xdg_surface test_xdg_surfaces[MAX_TEST_VIEWS];
+ 
++/* Set the window geometry (wlr_xdg_surface.geometry) of every test view */
++static void
++set_stub_xdg_geo(struct wlr_box geo)
++{
++	g_stub_xdg_geo = geo;
++	for (int i = 0; i < MAX_TEST_VIEWS; i++)
++		test_xdg_surfaces[i].geometry = geo;
++}
++
+ static void
+ reset_globals(void)
+ {
+@@ -361,7 +363,7 @@ setup(void)
+ 	g_output_at_result = &test_wlr_output;
+ 
+ 	/* Default XDG geometry: 400x300 */
+-	g_stub_xdg_geo = (struct wlr_box){ 0, 0, 400, 300 };
++	set_stub_xdg_geo((struct wlr_box){ 0, 0, 400, 300 });
+ 
+ 	/* Active workspace */
+ 	g_active_workspace = &test_workspace;
+@@ -376,6 +378,7 @@ init_view(int idx)
+ {
+ 	struct wm_view *v = &test_views[idx];
+ 	test_xdg_surfaces[idx].surface = NULL;
++	test_xdg_surfaces[idx].geometry = g_stub_xdg_geo;
+ 	test_toplevels[idx].base = &test_xdg_surfaces[idx];
+ 	test_toplevels[idx].width = 400;
+ 	test_toplevels[idx].height = 300;
+@@ -1011,7 +1014,7 @@ test_view_dims_normal(void)
+ {
+ 	setup();
+ 	init_view(0);
+-	g_stub_xdg_geo = (struct wlr_box){ 0, 0, 800, 600 };
++	set_stub_xdg_geo((struct wlr_box){ 0, 0, 800, 600 });
+ 
+ 	int w, h;
+ 	view_dims(&test_views[0], &w, &h);
+@@ -1029,7 +1032,7 @@ test_view_dims_zero_size(void)
+ {
+ 	setup();
+ 	init_view(0);
+-	g_stub_xdg_geo = (struct wlr_box){ 0, 0, 0, 0 };
++	set_stub_xdg_geo((struct wlr_box){ 0, 0, 0, 0 });
+ 
+ 	int w, h;
+ 	view_dims(&test_views[0], &w, &h);
+@@ -1049,7 +1052,7 @@ test_under_mouse_window_larger_than_output(void)
+ 	init_view(0);
+ 
+ 	/* Window is 2000x1200, larger than 1920x1080 output */
+-	g_stub_xdg_geo = (struct wlr_box){ 0, 0, 2000, 1200 };
++	set_stub_xdg_geo((struct wlr_box){ 0, 0, 2000, 1200 });
+ 
+ 	test_cursor.x = 960.0;
+ 	test_cursor.y = 540.0;
 diff --git a/tests/test_rules.c b/tests/test_rules.c
 index 19bf2bf..3fa58fe 100644
 --- a/tests/test_rules.c
@@ -598,6 +912,159 @@ index 19bf2bf..3fa58fe 100644
  }
  
  /* Test: init/finish lifecycle */
+diff --git a/tests/test_slit.c b/tests/test_slit.c
+index dbb43a6..0e90826 100644
+--- a/tests/test_slit.c
++++ b/tests/test_slit.c
+@@ -188,6 +188,7 @@ struct wlr_xdg_surface {
+ 	struct wlr_surface *surface;
+ 	void *data;
+ 	bool initial_commit;
++	struct wlr_box geometry;
+ };
+ 
+ struct wlr_xdg_toplevel {
+@@ -444,16 +445,6 @@ wlr_xwayland_surface_configure(struct wlr_xwayland_surface *surface,
+ }
+ 
+ /* XDG shell stubs */
+-static struct wlr_box g_xdg_geometry;
+-
+-static void
+-wlr_xdg_surface_get_geometry(struct wlr_xdg_surface *surface,
+-	struct wlr_box *box)
+-{
+-	(void)surface;
+-	*box = g_xdg_geometry;
+-}
+-
+ static uint32_t
+ wlr_xdg_toplevel_set_tiled(struct wlr_xdg_toplevel *toplevel,
+ 	uint32_t tiled)
+diff --git a/tests/test_small_protocols.c b/tests/test_small_protocols.c
+index 03f9f0b..86bf42c 100644
+--- a/tests/test_small_protocols.c
++++ b/tests/test_small_protocols.c
+@@ -157,9 +157,10 @@ wlr_fractional_scale_manager_v1_create(struct wl_display *display,
+ 
+ static struct wlr_presentation *
+ wlr_presentation_create(struct wl_display *display,
+-	struct wlr_backend *backend)
++	struct wlr_backend *backend, uint32_t version)
+ {
+ 	(void)display; (void)backend;
++	assert(version >= 1 && version <= 2);
+ 	g_presentation_create_count++;
+ 	if (g_presentation_returns_null)
+ 		return NULL;
+diff --git a/tests/test_tabgroup.c b/tests/test_tabgroup.c
+index b93700e..47a99d7 100644
+--- a/tests/test_tabgroup.c
++++ b/tests/test_tabgroup.c
+@@ -102,6 +102,7 @@ struct wlr_surface {
+ 
+ struct wlr_xdg_surface {
+ 	struct wlr_surface *surface;
++	struct wlr_box geometry;
+ };
+ 
+ struct wlr_xdg_toplevel {
+@@ -156,7 +157,6 @@ struct wm_view {
+ 
+ static int g_set_enabled_count;
+ static int g_set_position_count;
+-static int g_get_geometry_count;
+ static int g_set_size_count;
+ static int g_decoration_update_count;
+ static int g_focus_view_count;
+@@ -183,18 +183,6 @@ wlr_scene_node_set_position(struct wlr_scene_node *node, int x, int y)
+ 	g_set_position_count++;
+ }
+ 
+-static void
+-wlr_xdg_surface_get_geometry(struct wlr_xdg_surface *surface,
+-	struct wlr_box *box)
+-{
+-	/* Return a fixed geometry for the active view */
+-	box->x = 0;
+-	box->y = 0;
+-	box->width = 800;
+-	box->height = 600;
+-	g_get_geometry_count++;
+-}
+-
+ static uint32_t
+ wlr_xdg_toplevel_set_size(struct wlr_xdg_toplevel *toplevel,
+ 	int width, int height)
+@@ -247,7 +235,6 @@ reset_globals(void)
+ {
+ 	g_set_enabled_count = 0;
+ 	g_set_position_count = 0;
+-	g_get_geometry_count = 0;
+ 	g_set_size_count = 0;
+ 	g_decoration_update_count = 0;
+ 	g_focus_view_count = 0;
+@@ -262,6 +249,7 @@ make_view(int idx, const char *title)
+ 	/* Wire up xdg surface chain */
+ 	test_surfaces[idx].dummy = 0;
+ 	test_xdg_surfaces[idx].surface = &test_surfaces[idx];
++	test_xdg_surfaces[idx].geometry = (struct wlr_box){ 0, 0, 800, 600 };
+ 	test_toplevels[idx].base = &test_xdg_surfaces[idx];
+ 	test_toplevels[idx].width = 800;
+ 	test_toplevels[idx].height = 600;
+diff --git a/tests/test_tablet.c b/tests/test_tablet.c
+index 5fb7719..00d7bb1 100644
+--- a/tests/test_tablet.c
++++ b/tests/test_tablet.c
+@@ -449,8 +449,8 @@ wlr_scene_surface_try_from_buffer(struct wlr_scene_buffer *buffer)
+ }
+ 
+ static bool
+-wlr_surface_accepts_tablet_v2(struct wlr_tablet_v2_tablet *tablet,
+-	struct wlr_surface *surface)
++wlr_surface_accepts_tablet_v2(struct wlr_surface *surface,
++	struct wlr_tablet_v2_tablet *tablet)
+ {
+ 	(void)tablet;
+ 	(void)surface;
+diff --git a/tests/test_text_input.c b/tests/test_text_input.c
+index 51369ba..27aa3f0 100644
+--- a/tests/test_text_input.c
++++ b/tests/test_text_input.c
+@@ -219,13 +219,13 @@ struct wlr_input_method_keyboard_grab_v2 {
+ 
+ struct wlr_text_input_manager_v3 {
+ 	struct {
+-		struct wl_signal text_input;
++		struct wl_signal new_text_input;
+ 	} events;
+ };
+ 
+ struct wlr_input_method_manager_v2 {
+ 	struct {
+-		struct wl_signal input_method;
++		struct wl_signal new_input_method;
+ 	} events;
+ };
+ 
+@@ -276,7 +276,7 @@ static struct wlr_text_input_manager_v3 *
+ wlr_text_input_manager_v3_create(struct wl_display *display)
+ {
+ 	(void)display;
+-	wl_signal_init(&g_ti_mgr.events.text_input);
++	wl_signal_init(&g_ti_mgr.events.new_text_input);
+ 	return &g_ti_mgr;
+ }
+ 
+@@ -286,7 +286,7 @@ static struct wlr_input_method_manager_v2 *
+ wlr_input_method_manager_v2_create(struct wl_display *display)
+ {
+ 	(void)display;
+-	wl_signal_init(&g_im_mgr.events.input_method);
++	wl_signal_init(&g_im_mgr.events.new_input_method);
+ 	return &g_im_mgr;
+ }
+ 
 diff --git a/tests/test_toolbar_layout.c b/tests/test_toolbar_layout.c
 index 0313c81..bbaff39 100644
 --- a/tests/test_toolbar_layout.c
@@ -610,3 +1077,95 @@ index 0313c81..bbaff39 100644
  	char *title;
  	char *app_id;
  	struct wm_workspace *workspace;
+diff --git a/tests/test_view_logic.c b/tests/test_view_logic.c
+index 33a4211..e366fac 100644
+--- a/tests/test_view_logic.c
++++ b/tests/test_view_logic.c
+@@ -262,6 +262,7 @@ struct wlr_xdg_surface {
+ 	void *data;
+ 	bool initial_commit;
+ 	bool initialized;
++	struct wlr_box geometry;
+ 	/* not needed: events are on surface in 0.18 */
+ };
+ 
+@@ -886,14 +887,6 @@ wlr_xdg_toplevel_send_close(struct wlr_xdg_toplevel *tl)
+ 	(void)tl;
+ }
+ 
+-static void
+-wlr_xdg_surface_get_geometry(struct wlr_xdg_surface *surface,
+-	struct wlr_box *box)
+-{
+-	box->x = 0; box->y = 0;
+-	box->width = 800; box->height = 600;
+-}
+-
+ static struct wlr_xdg_surface *
+ wlr_xdg_surface_try_from_wlr_surface(struct wlr_surface *surface)
+ {
+@@ -1194,6 +1187,7 @@ setup_mock_view(int idx, struct wm_workspace *ws)
+ 
+ 	test_xdg_surfaces[idx].surface = &test_surfaces[idx];
+ 	test_xdg_surfaces[idx].initialized = true;
++	test_xdg_surfaces[idx].geometry = (struct wlr_box){ 0, 0, 800, 600 };
+ 	test_toplevels[idx].base = &test_xdg_surfaces[idx];
+ 	test_toplevels[idx].width = 800;
+ 	test_toplevels[idx].height = 600;
+@@ -1458,7 +1452,7 @@ test_view_get_geometry(void)
+ 
+ 	assert(geo.x == 150);
+ 	assert(geo.y == 250);
+-	/* wlr_xdg_surface_get_geometry stub returns 800x600 */
++	/* the test views' window geometry is 800x600 */
+ 	assert(geo.width == 800);
+ 	assert(geo.height == 600);
+ 
+@@ -1608,7 +1602,7 @@ test_view_resize_by(void)
+ 	init_test_server();
+ 	setup_mock_view(0, &test_workspace);
+ 
+-	/* wlr_xdg_surface_get_geometry returns 800x600 */
++	/* the test views' window geometry is 800x600 */
+ 	/* wlr_xdg_toplevel_set_size stub sets width/height */
+ 	wm_view_resize_by(&test_views[0], 100, -50);
+ 
+@@ -2479,8 +2473,8 @@ test_begin_interactive_resize_mode(void)
+ 	assert(test_server.cursor_mode == WM_CURSOR_RESIZE);
+ 	assert(test_server.resize_edges ==
+ 		(WLR_EDGE_RIGHT | WLR_EDGE_BOTTOM));
+-	/* grab_geobox should be set from wlr_xdg_surface_get_geometry
+-	 * (stub returns 0,0,800,600) plus view offset */
++	/* grab_geobox should be set from wlr_xdg_surface.geometry
++	 * (0,0,800,600 in the test views) plus view offset */
+ 	assert(test_server.grab_geobox.x == 100);
+ 	assert(test_server.grab_geobox.y == 200);
+ 	assert(test_server.grab_geobox.width == 800);
+diff --git a/tests/test_xwayland_logic.c b/tests/test_xwayland_logic.c
+index 9be6b28..e8ef049 100644
+--- a/tests/test_xwayland_logic.c
++++ b/tests/test_xwayland_logic.c
+@@ -169,7 +169,7 @@ struct wlr_surface {
+ };
+ 
+ /* XDG shell */
+-struct wlr_xdg_surface { struct wlr_surface *surface; };
++struct wlr_xdg_surface { struct wlr_surface *surface; bool initialized; };
+ struct wlr_xdg_toplevel {
+ 	struct wlr_xdg_surface *base;
+ };
+@@ -333,11 +333,12 @@ static void wlr_xwayland_surface_configure(
+ }
+ 
+ static void wlr_xwayland_surface_set_maximized(
+-	struct wlr_xwayland_surface *surface, bool maximized)
++	struct wlr_xwayland_surface *surface, bool maximized_horz,
++	bool maximized_vert)
+ {
+ 	(void)surface;
+ 	g_set_maximized_called = true;
+-	g_last_maximized_value = maximized;
++	g_last_maximized_value = maximized_horz && maximized_vert;
+ }
+ 
+ static void wlr_xwayland_surface_set_fullscreen(
