@@ -1,0 +1,8 @@
+.cache/
+vm/
+screenshots/*.ppm
+# upstream checkout used by the image build and dev loop; the PKGBUILD fetches it by commit
+third_party/fluxland/
+__pycache__/
+# unposted upstream drafts, kept locally
+docs/upstream/

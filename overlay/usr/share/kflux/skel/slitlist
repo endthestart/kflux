@@ -1,0 +1,9 @@
+# kflux slitlist -- "dockapps" shown in the slit, top to bottom.
+# Built in: clock cpu mem net volume disk
+# Your own: custom: LABEL : command   (prints the tile text; refreshed every 5s)
+clock
+cpu
+mem
+net
+volume
+# custom: UP : uptime -p | sed 's/up //; s/ hours\?/h/; s/ minutes\?/m/; s/,//g'

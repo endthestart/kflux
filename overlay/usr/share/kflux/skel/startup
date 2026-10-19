@@ -1,0 +1,3 @@
+# kflux startup -- shell commands run once when the session starts
+# (like ~/.fluxbox/startup, but without the final `exec fluxbox`).
+# konsole &

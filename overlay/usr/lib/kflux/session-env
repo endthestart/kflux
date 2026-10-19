@@ -1,0 +1,20 @@
+# Sourced by kflux-session and fluxland-kflux-session: the environment that
+# lets KDE apps and services run outside Plasma.
+export XDG_SESSION_TYPE=wayland
+export KDE_SESSION_VERSION=6
+export QT_QPA_PLATFORM="wayland;xcb"
+export QT_QPA_PLATFORMTHEME=kde
+export XDG_MENU_PREFIX=arch-
+export MOZ_ENABLE_WAYLAND=1
+export ELECTRON_OZONE_PLATFORM_HINT=auto
+
+# No GPU acceleration in a VM: software rendering throughout.
+if systemd-detect-virt -q; then
+    export WLR_RENDERER=pixman
+    export WLR_NO_HARDWARE_CURSORS=1
+    export QT_QUICK_BACKEND=software
+    export LIBGL_ALWAYS_SOFTWARE=1
+fi
+
+mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/kflux"
+[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/kflux/init" ] || kflux init --no-reload

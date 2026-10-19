@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=fluxland (kflux)
+Comment=Fluxbox-style desktop with real tabs: ecliptik/fluxland (wlroots 0.20 port) reading the kflux config, with KDE apps and services
+Exec=fluxland-kflux-session
+Type=Application
+DesktopNames=fluxland;KDE

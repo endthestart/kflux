@@ -1,0 +1,42 @@
+# Maintainer: kflux contributors
+# AUR-ready PKGBUILD for kflux. Before publishing: tag v$pkgver,
+# replace sha256sums with the release tarball's sum (updpkgsums).
+# Local test: KFLUX_SRC=file:///path/to/kflux-$pkgver.tar.gz makepkg -f
+_owner=endthestart
+pkgname=kflux
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="A Fluxbox-style desktop for KDE apps on Wayland"
+arch=('any')
+url="https://github.com/${_owner}/kflux"
+license=('MIT')
+depends=(
+  'python' 'labwc' 'waybar' 'swaybg' 'swaylock' 'swayidle' 'mako' 'libnotify'
+  'wlr-randr' 'wtype' 'grim' 'slurp' 'xorg-xwayland'
+  'plasma-integration' 'breeze' 'breeze-icons' 'archlinux-xdg-menu'
+  'xdg-desktop-portal-kde' 'xdg-desktop-portal-wlr' 'polkit-kde-agent'
+  'ttf-terminus-nerd' 'ttf-dejavu'
+)
+optdepends=(
+  'fluxbox: the 27 classic Fluxbox styles in the Styles menu'
+  'labwc-kflux: Fluxbox-style window tabs (replaces labwc)'
+  'konsole: terminal (Alt+F1)'
+  'dolphin: file manager'
+  'kate: editor for the Configure menu'
+  'krunner: run dialog (Alt+F2)'
+  'systemsettings: KDE settings modules (network, audio, colours)'
+  'plasma-nm: network settings module'
+  'plasma-pa: audio settings module'
+  'kdeconnect: phone integration'
+  'network-manager-applet: network tray icon'
+  'conky: desktop stats in a corner'
+  'wdisplays: display settings'
+)
+_src="${KFLUX_SRC:-https://github.com/${_owner}/kflux/archive/refs/tags/v${pkgver}.tar.gz}"
+source=("kflux-${pkgver}.tar.gz::${_src}")
+sha256sums=('SKIP')
+
+package() {
+  cd "kflux-${pkgver}"
+  make DESTDIR="$pkgdir" PREFIX=/usr install-kflux
+}

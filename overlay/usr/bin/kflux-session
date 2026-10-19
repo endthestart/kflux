@@ -1,0 +1,7 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# kflux session: Fluxbox-style labwc desktop with KDE apps and services.
+export XDG_CURRENT_DESKTOP=kflux:KDE
+export XDG_SESSION_DESKTOP=kflux
+. /usr/lib/kflux/session-env
+exec labwc >"${XDG_CACHE_HOME:-$HOME/.cache}/kflux/labwc.log" 2>&1

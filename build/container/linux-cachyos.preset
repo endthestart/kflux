@@ -1,0 +1,4 @@
+# kflux: single generic image, no fallback (see mkinitcpio.conf.d/kflux.conf)
+ALL_kver="/boot/vmlinuz-linux-cachyos"
+PRESETS=('default')
+default_image="/boot/initramfs-linux-cachyos.img"

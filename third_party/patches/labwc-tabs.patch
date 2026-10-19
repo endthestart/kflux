@@ -1,0 +1,1424 @@
+labwc-tabs.patch: Fluxbox-style window tabs for labwc 0.20.2 (kflux).
+Licence: GPL-2.0-only, like labwc, which it modifies.
+
+Design: decisions/0004-tabs-in-labwc.md in the kflux repository.
+New: src/tabs.c, include/tabs.h. Hooks: view visibility/focusability, frame-state
+handoff (view_take_frame_state), titlebar tab strip (ssd-titlebar.c), focus
+redirect (desktop.c), foreign-toplevel retargeting, StartTabbing outline drag
+(interactive.c, cursor.c, overlay.c), actions ActivateTab, NextTab, PreviousTab,
+GoToTab, MoveTabLeft, MoveTabRight, DetachTab, StartTabbing,
+GroupWithWindowBelow, JoinTabGroup (action.c, labwc-actions.5).
+Apply with: patch -Np1 -i labwc-tabs.patch (in labwc-0.20.2/).
+
+diff --git a/docs/labwc-actions.5.scd b/docs/labwc-actions.5.scd
+index 3414247..277c9a3 100644
+--- a/docs/labwc-actions.5.scd
++++ b/docs/labwc-actions.5.scd
+@@ -412,6 +412,51 @@ Actions are used in menus and keyboard/mouse bindings.
+ 	Use together with the WarpCursor action to not just hide the cursor but
+ 	to additionally move it away to prevent e.g. hover effects.
+ 
++*<action name="ActivateTab" />*
++	Switch to the tab under the pointer. Only useful in a "Title" or
++	"TitleBar" mousebind, typically after Focus and Raise.
++
++	Windows can be grouped into tabs, as in Fluxbox: a group shares one
++	frame and only its active window is shown. The others are hidden from
++	the window switcher and from taskbars, and the titlebar shows one tab
++	per window. Moving, resizing, maximizing, minimizing and sending the
++	frame to another workspace act on the whole group. Only windows with a
++	server-side titlebar can be grouped.
++
++*<action name="NextTab" />*++
++*<action name="PreviousTab" />*
++	Switch to the next or previous tab of the active window's group,
++	wrapping around.
++
++*<action name="GoToTab" index="value" />*
++	Switch to the tab at *index* (1 is the first; negative values count
++	from the last).
++
++*<action name="MoveTabLeft" />*++
++*<action name="MoveTabRight" />*
++	Move the active tab one place left or right in its group.
++
++*<action name="DetachTab" />*
++	Take the active window out of its group into a window of its own.
++
++*<action name="StartTabbing" />*
++	Start dragging an outline of the window. Dropped on another window's
++	titlebar, the window joins that window's group as its active tab;
++	dropped anywhere else, it leaves its group (if any) and moves there.
++	Use in a "Title" or "TitleBar" Drag mousebind, for example with the
++	Ctrl modifier as in Fluxbox.
++
++*<action name="GroupWithWindowBelow" />*
++	Add the topmost window beneath the active one that it overlaps (or, if
++	none overlaps, the next window down) to the active window's group, in
++	the background.
++
++*<action name="JoinTabGroup" identifier="value" />*
++	Join the group of the topmost visible window on the current workspace
++	whose identifier matches the glob *value*. Intended for window rules,
++	to group windows automatically when they first map. Does nothing if the
++	window is already grouped.
++
+ *<action name="EnableScrollWheelEmulation" />*++
+ *<action name="DisableScrollWheelEmulation" />*++
+ *<action name="ToggleScrollWheelEmulation">*
+diff --git a/include/foreign-toplevel/ext-foreign.h b/include/foreign-toplevel/ext-foreign.h
+index d9442c0..ffabbc8 100644
+--- a/include/foreign-toplevel/ext-foreign.h
++++ b/include/foreign-toplevel/ext-foreign.h
+@@ -22,6 +22,8 @@ struct ext_foreign_toplevel {
+ 
+ void ext_foreign_toplevel_init(struct ext_foreign_toplevel *ext_toplevel,
+ 	struct view *view);
++void ext_foreign_toplevel_set_view(struct ext_foreign_toplevel *ext_toplevel,
++	struct view *view);
+ void ext_foreign_toplevel_finish(struct ext_foreign_toplevel *ext_toplevel);
+ 
+ #endif /* LABWC_EXT_FOREIGN_TOPLEVEL_H */
+diff --git a/include/foreign-toplevel/foreign.h b/include/foreign-toplevel/foreign.h
+index bc22677..f4eed24 100644
+--- a/include/foreign-toplevel/foreign.h
++++ b/include/foreign-toplevel/foreign.h
+@@ -9,5 +9,8 @@ struct foreign_toplevel *foreign_toplevel_create(struct view *view);
+ void foreign_toplevel_set_parent(struct foreign_toplevel *toplevel,
+ 	struct foreign_toplevel *parent);
+ void foreign_toplevel_destroy(struct foreign_toplevel *toplevel);
++/* Re-point the handle at another view (a tab group's new active member) */
++void foreign_toplevel_set_view(struct foreign_toplevel *toplevel,
++	struct view *view);
+ 
+ #endif /* LABWC_FOREIGN_TOPLEVEL_H */
+diff --git a/include/foreign-toplevel/wlr-foreign.h b/include/foreign-toplevel/wlr-foreign.h
+index 2da4475..d8ef757 100644
+--- a/include/foreign-toplevel/wlr-foreign.h
++++ b/include/foreign-toplevel/wlr-foreign.h
+@@ -34,6 +34,8 @@ void wlr_foreign_toplevel_init(struct wlr_foreign_toplevel *wlr_toplevel,
+ 	struct view *view);
+ void wlr_foreign_toplevel_set_parent(struct wlr_foreign_toplevel *wlr_toplevel,
+ 	struct wlr_foreign_toplevel *parent);
++void wlr_foreign_toplevel_set_view(struct wlr_foreign_toplevel *wlr_toplevel,
++	struct view *view);
+ void wlr_foreign_toplevel_finish(struct wlr_foreign_toplevel *wlr_toplevel);
+ 
+ #endif /* LABWC_WLR_FOREIGN_TOPLEVEL_H */
+diff --git a/include/ssd-internal.h b/include/ssd-internal.h
+index 600b907..72c1e29 100644
+--- a/include/ssd-internal.h
++++ b/include/ssd-internal.h
+@@ -104,6 +104,8 @@ struct ssd {
+ 			struct wlr_scene_buffer *corner_right;
+ 			struct wlr_scene_buffer *bar;
+ 			struct scaled_font_buffer *title;
++			/* Tab strip replacing the title when grouped */
++			struct wlr_scene_tree *tabs;
+ 			struct wl_list buttons_left; /* ssd_button.link */
+ 			struct wl_list buttons_right; /* ssd_button.link */
+ 		} subtrees[2]; /* indexed by enum ssd_active_state */
+diff --git a/include/ssd.h b/include/ssd.h
+index 9c61747..2e8645f 100644
+--- a/include/ssd.h
++++ b/include/ssd.h
+@@ -44,6 +44,8 @@ int ssd_get_corner_width(void);
+ void ssd_update_margin(struct ssd *ssd);
+ void ssd_set_active(struct ssd *ssd, bool active);
+ void ssd_update_title(struct ssd *ssd);
++/* Rebuild the tab strip after the view's tab group changed */
++void ssd_update_tabs(struct ssd *ssd);
+ void ssd_update_geometry(struct ssd *ssd);
+ void ssd_destroy(struct ssd *ssd);
+ void ssd_set_titlebar(struct ssd *ssd, bool enabled);
+diff --git a/include/tabs.h b/include/tabs.h
+new file mode 100644
+index 0000000..24015c4
+--- /dev/null
++++ b/include/tabs.h
+@@ -0,0 +1,71 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef LABWC_TABS_H
++#define LABWC_TABS_H
++
++#include <stdbool.h>
++#include <wayland-util.h>
++
++struct view;
++struct cursor_context;
++
++/*
++ * Fluxbox-style tab groups. A group is a list of ordinary views sharing one
++ * frame: only the active member is shown, and it carries the frame state
++ * (geometry, maximized/tiled/fullscreen, workspace, layer...). The others are
++ * hidden, unfocusable and have no foreign-toplevel handle. Whenever the active
++ * member changes, the new one takes over the old one's frame state.
++ */
++struct tab_group {
++	struct wl_list members; /* struct view.tab_link */
++	struct view *active;
++};
++
++/* True if @view is a background (hidden) member of a tab group */
++bool view_is_hidden_tab(struct view *view);
++
++/* Number of members of @view's group, or 1 if not grouped */
++int tabs_count(struct view *view);
++
++/*
++ * Make @view a member of @target's group (creating it if needed), placed
++ * after @after (or last if NULL), and make it the active tab.
++ */
++void tabs_attach(struct view *view, struct view *target, struct view *after);
++
++/* Take @view out of its group, keeping it where it is */
++void tabs_detach(struct view *view);
++
++/* Make @view the active member of its group */
++void tabs_activate(struct view *view);
++
++/* Switch to the next (dir > 0) or previous tab, wrapping */
++void tabs_cycle(struct view *view, int dir);
++
++/* Switch to the nth tab (1-based; negative counts from the end) */
++void tabs_go_to(struct view *view, int index);
++
++/* Move the active tab one place left (dir < 0) or right */
++void tabs_move(struct view *view, int dir);
++
++/* Activate the tab under the cursor (mousebind on a titlebar) */
++void tabs_activate_at_cursor(struct cursor_context *ctx);
++
++/* Tab @view into the topmost window beneath it that it overlaps */
++void tabs_group_with_window_below(struct view *view);
++
++/* Join the topmost visible window whose identifier matches @pattern */
++bool tabs_join_by_identifier(struct view *view, const char *pattern);
++
++/* Interactive tabbing (Fluxbox StartTabbing): an outline follows the cursor */
++void tabs_start_tabbing(struct view *view);
++bool tabs_tabbing_active(void);
++void tabs_tabbing_update(void);
++void tabs_tabbing_finish(struct view *view);
++void tabs_tabbing_cancel(void);
++
++/* Hooks */
++void tabs_on_unmap(struct view *view);
++void tabs_on_moved(struct view *view);
++void tabs_on_title_changed(struct view *view);
++
++#endif /* LABWC_TABS_H */
+diff --git a/include/view.h b/include/view.h
+index 46943ab..5defc5a 100644
+--- a/include/view.h
++++ b/include/view.h
+@@ -91,6 +91,7 @@ enum view_layer {
+ struct view;
+ struct wlr_surface;
+ struct foreign_toplevel;
++struct tab_group;
+ 
+ /* Common to struct view and struct xwayland_unmanaged */
+ struct mappable {
+@@ -272,6 +273,10 @@ struct view {
+ 
+ 	struct foreign_toplevel *foreign_toplevel;
+ 
++	/* Fluxbox-style tabs (see tabs.h); NULL unless grouped */
++	struct tab_group *tab_group;
++	struct wl_list tab_link; /* tab_group.members */
++
+ 	/* used by scaled_icon_buffer */
+ 	struct {
+ 		char *name;
+@@ -617,6 +622,13 @@ void view_reload_ssd(struct view *view);
+ 
+ void view_set_shade(struct view *view, bool shaded);
+ 
++/*
++ * view_take_frame_state() - give @view the frame state of @from (workspace,
++ * layer, output, fullscreen/maximized/tiled state, geometry, shade and
++ * minimized state). Used when the active tab of a group changes.
++ */
++void view_take_frame_state(struct view *view, struct view *from);
++
+ /* Icon buffers set with this function are dropped later */
+ void view_set_icon(struct view *view, const char *icon_name,
+ 	struct wl_array *buffers);
+diff --git a/src/action.c b/src/action.c
+index 31a8fe5..49e593b 100644
+--- a/src/action.c
++++ b/src/action.c
+@@ -31,6 +31,7 @@
+ #include "regions.h"
+ #include "show-desktop.h"
+ #include "ssd.h"
++#include "tabs.h"
+ #include "theme.h"
+ #include "translate.h"
+ #include "view.h"
+@@ -140,6 +141,16 @@ struct action_arg_list {
+ 	X(TOGGLE_SHOW_DESKTOP, "ToggleShowDesktop") \
+ 	X(WARP_CURSOR, "WarpCursor") \
+ 	X(HIDE_CURSOR, "HideCursor") \
++	X(ACTIVATE_TAB, "ActivateTab") \
++	X(NEXT_TAB, "NextTab") \
++	X(PREVIOUS_TAB, "PreviousTab") \
++	X(GO_TO_TAB, "GoToTab") \
++	X(MOVE_TAB_LEFT, "MoveTabLeft") \
++	X(MOVE_TAB_RIGHT, "MoveTabRight") \
++	X(DETACH_TAB, "DetachTab") \
++	X(START_TABBING, "StartTabbing") \
++	X(GROUP_WITH_WINDOW_BELOW, "GroupWithWindowBelow") \
++	X(JOIN_TAB_GROUP, "JoinTabGroup") \
+ 	X(DEBUG_TOGGLE_KEY_STATE_INDICATOR, "DebugToggleKeyStateIndicator")
+ 
+ /*
+@@ -536,6 +547,18 @@ action_arg_from_xml_node(struct action *action, const char *nodename, const char
+ 			goto cleanup;
+ 		}
+ 		break;
++	case ACTION_TYPE_GO_TO_TAB:
++		if (!strcmp(argument, "index")) {
++			action_arg_add_int(action, argument, atoi(content));
++			goto cleanup;
++		}
++		break;
++	case ACTION_TYPE_JOIN_TAB_GROUP:
++		if (!strcmp(argument, "identifier")) {
++			action_arg_add_str(action, argument, content);
++			goto cleanup;
++		}
++		break;
+ 	case ACTION_TYPE_IF:
+ 		if (!strcmp(argument, "message.prompt")) {
+ 			action_arg_add_str(action, "message.prompt", content);
+@@ -653,6 +676,13 @@ action_is_valid(struct action *action)
+ 	case ACTION_TYPE_SNAP_TO_REGION:
+ 		arg_name = "region";
+ 		break;
++	case ACTION_TYPE_GO_TO_TAB:
++		arg_name = "index";
++		arg_type = LAB_ACTION_ARG_INT;
++		break;
++	case ACTION_TYPE_JOIN_TAB_GROUP:
++		arg_name = "identifier";
++		break;
+ 	case ACTION_TYPE_IF:
+ 	case ACTION_TYPE_FOR_EACH:
+ 		return action_branches_are_valid(action);
+@@ -813,7 +843,8 @@ view_for_action(struct view *activator, struct action *action, struct cursor_con
+ 	switch (action->type) {
+ 	case ACTION_TYPE_FOCUS:
+ 	case ACTION_TYPE_MOVE:
+-	case ACTION_TYPE_RESIZE: {
++	case ACTION_TYPE_RESIZE:
++	case ACTION_TYPE_START_TABBING: {
+ 		*ctx = get_cursor_context();
+ 		return ctx->view;
+ 	}
+@@ -1600,6 +1631,51 @@ run_action(struct view *view, struct action *action,
+ 	case ACTION_TYPE_DEBUG_TOGGLE_KEY_STATE_INDICATOR:
+ 		key_state_indicator_toggle();
+ 		break;
++	case ACTION_TYPE_ACTIVATE_TAB:
++		tabs_activate_at_cursor(ctx);
++		break;
++	case ACTION_TYPE_NEXT_TAB:
++		tabs_cycle(view, 1);
++		break;
++	case ACTION_TYPE_PREVIOUS_TAB:
++		tabs_cycle(view, -1);
++		break;
++	case ACTION_TYPE_GO_TO_TAB:
++		tabs_go_to(view, action_get_int(action, "index", 1));
++		break;
++	case ACTION_TYPE_MOVE_TAB_LEFT:
++		tabs_move(view, -1);
++		break;
++	case ACTION_TYPE_MOVE_TAB_RIGHT:
++		tabs_move(view, 1);
++		break;
++	case ACTION_TYPE_DETACH_TAB:
++		if (view && view->tab_group) {
++			tabs_detach(view);
++			if (view_is_floating(view)) {
++				int offset = rc.theme->titlebar_height;
++				view_move(view, view->pending.x + offset,
++					view->pending.y + offset);
++			}
++			desktop_focus_view(view, /*raise*/ true);
++		}
++		break;
++	case ACTION_TYPE_START_TABBING:
++		if (view) {
++			/* As for Move: mousebinds set the grab context on press */
++			if (view != server.seat.pressed.ctx.view) {
++				interactive_set_grab_context(ctx);
++			}
++			tabs_start_tabbing(view);
++		}
++		break;
++	case ACTION_TYPE_GROUP_WITH_WINDOW_BELOW:
++		tabs_group_with_window_below(view);
++		break;
++	case ACTION_TYPE_JOIN_TAB_GROUP:
++		tabs_join_by_identifier(view,
++			action_get_str(action, "identifier", NULL));
++		break;
+ 	case ACTION_TYPE_INVALID:
+ 		wlr_log(WLR_ERROR, "Not executing unknown action");
+ 		break;
+@@ -1649,6 +1725,10 @@ actions_run(struct view *activator, struct wl_list *actions, struct cursor_conte
+ 		 * previous action
+ 		 */
+ 		struct view *view = view_for_action(activator, action, &ctx);
++		/* A previous ActivateTab may have hidden the activator */
++		if (view && view_is_hidden_tab(view)) {
++			view = view->tab_group->active;
++		}
+ 
+ 		run_action(view, action, &ctx);
+ 	}
+diff --git a/src/desktop.c b/src/desktop.c
+index 57ef9e3..02d7de8 100644
+--- a/src/desktop.c
++++ b/src/desktop.c
+@@ -17,6 +17,7 @@
+ #include "output.h"
+ #include "show-desktop.h"
+ #include "ssd.h"
++#include "tabs.h"
+ #include "view.h"
+ #include "workspaces.h"
+ 
+@@ -126,6 +127,11 @@ desktop_focus_view_internal(struct view *view, bool raise, bool allow_delay)
+ 		return;
+ 	}
+ 
++	/* Focusing a background tab switches to it */
++	if (view_is_hidden_tab(view)) {
++		tabs_activate(view);
++	}
++
+ 	if (view->minimized) {
+ 		/*
+ 		 * Unminimizing will map the view which triggers a call to this
+diff --git a/src/foreign-toplevel/ext-foreign.c b/src/foreign-toplevel/ext-foreign.c
+index 1dfa1d9..2b45788 100644
+--- a/src/foreign-toplevel/ext-foreign.c
++++ b/src/foreign-toplevel/ext-foreign.c
+@@ -87,6 +87,22 @@ ext_foreign_toplevel_init(struct ext_foreign_toplevel *ext_toplevel,
+ 	CONNECT_SIGNAL(view, &ext_toplevel->on_view, new_title);
+ }
+ 
++void
++ext_foreign_toplevel_set_view(struct ext_foreign_toplevel *ext_toplevel,
++		struct view *view)
++{
++	ext_toplevel->view = view;
++	if (!ext_toplevel->handle) {
++		return;
++	}
++	ext_toplevel->handle->data = view;
++	wl_list_remove(&ext_toplevel->on_view.new_app_id.link);
++	wl_list_remove(&ext_toplevel->on_view.new_title.link);
++	handle_new_title(&ext_toplevel->on_view.new_title, NULL);
++	CONNECT_SIGNAL(view, &ext_toplevel->on_view, new_app_id);
++	CONNECT_SIGNAL(view, &ext_toplevel->on_view, new_title);
++}
++
+ void
+ ext_foreign_toplevel_finish(struct ext_foreign_toplevel *ext_toplevel)
+ {
+diff --git a/src/foreign-toplevel/foreign.c b/src/foreign-toplevel/foreign.c
+index 4290ffd..4335086 100644
+--- a/src/foreign-toplevel/foreign.c
++++ b/src/foreign-toplevel/foreign.c
+@@ -34,6 +34,15 @@ foreign_toplevel_set_parent(struct foreign_toplevel *toplevel, struct foreign_to
+ 		parent ? &parent->wlr_toplevel : NULL);
+ }
+ 
++void
++foreign_toplevel_set_view(struct foreign_toplevel *toplevel, struct view *view)
++{
++	assert(toplevel);
++	assert(view);
++	wlr_foreign_toplevel_set_view(&toplevel->wlr_toplevel, view);
++	ext_foreign_toplevel_set_view(&toplevel->ext_toplevel, view);
++}
++
+ void
+ foreign_toplevel_destroy(struct foreign_toplevel *toplevel)
+ {
+diff --git a/src/foreign-toplevel/wlr-foreign.c b/src/foreign-toplevel/wlr-foreign.c
+index 3e589ef..06eae65 100644
+--- a/src/foreign-toplevel/wlr-foreign.c
++++ b/src/foreign-toplevel/wlr-foreign.c
+@@ -224,6 +224,41 @@ wlr_foreign_toplevel_init(struct wlr_foreign_toplevel *wlr_toplevel,
+ 	CONNECT_SIGNAL(view, &wlr_toplevel->on_view, activated);
+ }
+ 
++void
++wlr_foreign_toplevel_set_view(struct wlr_foreign_toplevel *wlr_toplevel,
++		struct view *view)
++{
++	if (!wlr_toplevel->handle) {
++		wlr_toplevel->view = view;
++		return;
++	}
++	wl_list_remove(&wlr_toplevel->on_view.new_app_id.link);
++	wl_list_remove(&wlr_toplevel->on_view.new_title.link);
++	wl_list_remove(&wlr_toplevel->on_view.new_outputs.link);
++	wl_list_remove(&wlr_toplevel->on_view.maximized.link);
++	wl_list_remove(&wlr_toplevel->on_view.minimized.link);
++	wl_list_remove(&wlr_toplevel->on_view.fullscreened.link);
++	wl_list_remove(&wlr_toplevel->on_view.activated.link);
++
++	wlr_toplevel->view = view;
++	handle_new_app_id(&wlr_toplevel->on_view.new_app_id, NULL);
++	handle_new_title(&wlr_toplevel->on_view.new_title, NULL);
++	handle_new_outputs(&wlr_toplevel->on_view.new_outputs, NULL);
++	handle_maximized(&wlr_toplevel->on_view.maximized, NULL);
++	handle_minimized(&wlr_toplevel->on_view.minimized, NULL);
++	handle_fullscreened(&wlr_toplevel->on_view.fullscreened, NULL);
++	handle_activated(&wlr_toplevel->on_view.activated,
++		&(bool){view == server.active_view});
++
++	CONNECT_SIGNAL(view, &wlr_toplevel->on_view, new_app_id);
++	CONNECT_SIGNAL(view, &wlr_toplevel->on_view, new_title);
++	CONNECT_SIGNAL(view, &wlr_toplevel->on_view, new_outputs);
++	CONNECT_SIGNAL(view, &wlr_toplevel->on_view, maximized);
++	CONNECT_SIGNAL(view, &wlr_toplevel->on_view, minimized);
++	CONNECT_SIGNAL(view, &wlr_toplevel->on_view, fullscreened);
++	CONNECT_SIGNAL(view, &wlr_toplevel->on_view, activated);
++}
++
+ void
+ wlr_foreign_toplevel_set_parent(struct wlr_foreign_toplevel *wlr_toplevel,
+ 		struct wlr_foreign_toplevel *parent)
+diff --git a/src/input/cursor.c b/src/input/cursor.c
+index e8ac7d9..8221920 100644
+--- a/src/input/cursor.c
++++ b/src/input/cursor.c
+@@ -34,6 +34,7 @@
+ #include "output.h"
+ #include "resistance.h"
+ #include "resize-outlines.h"
++#include "tabs.h"
+ #include "ssd.h"
+ #include "view.h"
+ #include "xwayland.h"
+@@ -273,6 +274,12 @@ process_cursor_move(uint32_t time)
+ {
+ 	struct view *view = server.grabbed_view;
+ 
++	/* StartTabbing drags an outline, not the window */
++	if (tabs_tabbing_active()) {
++		tabs_tabbing_update();
++		return;
++	}
++
+ 	int x = server.grab_box.x + (server.seat.cursor->x - server.grab_x);
+ 	int y = server.grab_box.y + (server.seat.cursor->y - server.grab_y);
+ 
+diff --git a/src/interactive.c b/src/interactive.c
+index dcea0c0..1a6306c 100644
+--- a/src/interactive.c
++++ b/src/interactive.c
+@@ -8,6 +8,7 @@
+ #include "output.h"
+ #include "regions.h"
+ #include "resize-indicator.h"
++#include "tabs.h"
+ #include "view.h"
+ #include "window-rules.h"
+ 
+@@ -325,6 +326,11 @@ interactive_finish(struct view *view)
+ 		return;
+ 	}
+ 
++	if (tabs_tabbing_active()) {
++		tabs_tabbing_finish(view);
++		return;
++	}
++
+ 	if (server.input_mode == LAB_INPUT_STATE_MOVE) {
+ 		if (!snap_to_region(view)) {
+ 			snap_to_edge(view);
+@@ -349,6 +355,7 @@ interactive_cancel(struct view *view)
+ 	}
+ 
+ 	server.grabbed_view = NULL;
++	tabs_tabbing_cancel();
+ 
+ 	/*
+ 	 * It's possible that grabbed_view was set but interactive_begin()
+diff --git a/src/meson.build b/src/meson.build
+index 05163cf..7323fae 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -25,6 +25,7 @@ labwc_sources = files(
+   'show-desktop.c',
+   'snap-constraints.c',
+   'snap.c',
++  'tabs.c',
+   'tearing.c',
+   'theme.c',
+   'view.c',
+diff --git a/src/overlay.c b/src/overlay.c
+index 817bb3f..e9aa1da 100644
+--- a/src/overlay.c
++++ b/src/overlay.c
+@@ -9,6 +9,7 @@
+ #include "labwc.h"
+ #include "output.h"
+ #include "regions.h"
++#include "tabs.h"
+ #include "theme.h"
+ #include "view.h"
+ 
+@@ -137,6 +138,11 @@ show_edge_overlay(struct seat *seat, enum lab_edge edge1, enum lab_edge edge2,
+ void
+ overlay_update(struct seat *seat)
+ {
++	/* No snapping previews while dragging a tab */
++	if (tabs_tabbing_active()) {
++		return;
++	}
++
+ 	/* Region-snapping overlay */
+ 	if (regions_should_snap()) {
+ 		struct region *region = regions_from_cursor();
+diff --git a/src/ssd/ssd-titlebar.c b/src/ssd/ssd-titlebar.c
+index d1a0881..aedfac9 100644
+--- a/src/ssd/ssd-titlebar.c
++++ b/src/ssd/ssd-titlebar.c
+@@ -16,6 +16,7 @@
+ #include "scaled-buffer/scaled-img-buffer.h"
+ #include "ssd.h"
+ #include "ssd-internal.h"
++#include "tabs.h"
+ #include "theme.h"
+ #include "view.h"
+ 
+@@ -378,7 +379,7 @@ ssd_update_title_positions(struct ssd *ssd, int offset_left, int offset_right)
+ 		x = offset_left;
+ 		y = (theme->titlebar_height - title->height) / 2;
+ 
+-		if (title_bg_width <= 0) {
++		if (title_bg_width <= 0 || tabs_count(view) > 1) {
+ 			wlr_scene_node_set_enabled(&title->scene_buffer->node, false);
+ 			continue;
+ 		}
+@@ -432,10 +433,111 @@ get_title_offsets(struct ssd *ssd, int *offset_left, int *offset_right)
+ 	}
+ }
+ 
++/*
++ * Fluxbox-style tab strip: when the view is in a tab group, the title area is
++ * split into one tab per member, each showing that member's title. The node
++ * descriptors carry the member, for ActivateTab and StartTabbing.
++ */
++static void
++update_tab_strip(struct ssd *ssd)
++{
++	struct view *view = ssd->view;
++	struct theme *theme = rc.theme;
++
++	enum ssd_active_state active;
++	FOR_EACH_ACTIVE_STATE(active) {
++		struct ssd_titlebar_subtree *subtree = &ssd->titlebar.subtrees[active];
++		if (subtree->tabs) {
++			wlr_scene_node_destroy(&subtree->tabs->node);
++			subtree->tabs = NULL;
++		}
++	}
++
++	int count = tabs_count(view);
++	if (!ssd->titlebar.tree || count < 2) {
++		return;
++	}
++	int offset_left, offset_right;
++	get_title_offsets(ssd, &offset_left, &offset_right);
++	int width = view->current.width - offset_left - offset_right;
++	if (width < count) {
++		return;
++	}
++
++	const int padding = 4;
++	const float clear[4] = {0, 0, 0, 0};
++	const float shade[4] = {0, 0, 0, 0.3};
++	int height = theme->titlebar_height;
++
++	FOR_EACH_ACTIVE_STATE(active) {
++		struct ssd_titlebar_subtree *subtree = &ssd->titlebar.subtrees[active];
++		subtree->tabs = lab_wlr_scene_tree_create(subtree->tree);
++		struct font *font = active ?
++			&rc.font_activewindow : &rc.font_inactivewindow;
++
++		int i = 0;
++		struct view *member;
++		wl_list_for_each(member, &view->tab_group->members, tab_link) {
++			int x0 = offset_left + width * i / count;
++			int x1 = offset_left + width * (i + 1) / count;
++			bool selected = member == view->tab_group->active;
++			i++;
++
++			struct wlr_scene_rect *bg = wlr_scene_rect_create(
++				subtree->tabs, x1 - x0, height,
++				selected ? clear : shade);
++			wlr_scene_node_set_position(&bg->node, x0, 0);
++			node_descriptor_create(&bg->node, LAB_NODE_TITLE, view, member);
++
++			if (i < count) {
++				struct wlr_scene_rect *sep = wlr_scene_rect_create(
++					subtree->tabs, 1, height,
++					theme->window[active].border_color);
++				wlr_scene_node_set_position(&sep->node, x1 - 1, 0);
++			}
++
++			int label_width = x1 - x0 - 2 * padding;
++			if (label_width <= 0) {
++				continue;
++			}
++			struct scaled_font_buffer *label =
++				scaled_font_buffer_create(subtree->tabs);
++			if (!label) {
++				continue;
++			}
++			const float *color = selected ?
++				theme->window[active].label_text_color :
++				theme->window[SSD_INACTIVE].label_text_color;
++			scaled_font_buffer_update(label, member->title,
++				label_width, font, color, clear);
++			int x = x0 + padding;
++			if (theme->window_label_text_justify == LAB_JUSTIFY_CENTER) {
++				x += (label_width - label->width) / 2;
++			} else if (theme->window_label_text_justify == LAB_JUSTIFY_RIGHT) {
++				x += label_width - label->width;
++			}
++			wlr_scene_node_set_position(&label->scene_buffer->node,
++				x, (height - label->height) / 2);
++			node_descriptor_create(&label->scene_buffer->node,
++				LAB_NODE_TITLE, view, member);
++		}
++	}
++}
++
++void
++ssd_update_tabs(struct ssd *ssd)
++{
++	ssd_update_title(ssd);
++}
++
+ void
+ ssd_update_title(struct ssd *ssd)
+ {
+-	if (!ssd || !rc.show_title) {
++	if (!ssd) {
++		return;
++	}
++	update_tab_strip(ssd);
++	if (!rc.show_title) {
+ 		return;
+ 	}
+ 
+diff --git a/src/tabs.c b/src/tabs.c
+new file mode 100644
+index 0000000..5dc875c
+--- /dev/null
++++ b/src/tabs.c
+@@ -0,0 +1,561 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Fluxbox-style window tabs. See include/tabs.h for the model.
++ */
++#include "tabs.h"
++#include <assert.h>
++#include <stdlib.h>
++#include <wlr/types/wlr_cursor.h>
++#include <wlr/types/wlr_scene.h>
++#include "common/lab-scene-rect.h"
++#include "common/match.h"
++#include "common/mem.h"
++#include "config/rcxml.h"
++#include "foreign-toplevel/foreign.h"
++#include "input/cursor.h"
++#include "labwc.h"
++#include "node.h"
++#include "ssd.h"
++#include "theme.h"
++#include "view.h"
++#include "window-rules.h"
++
++static struct {
++	struct view *view;
++	struct lab_scene_rect *outline;
++	struct wlr_box geo;
++} tabbing;
++
++bool
++view_is_hidden_tab(struct view *view)
++{
++	return view->tab_group && view->tab_group->active != view;
++}
++
++int
++tabs_count(struct view *view)
++{
++	return view->tab_group ? wl_list_length(&view->tab_group->members) : 1;
++}
++
++/* Tabs are drawn in the server-side titlebar, so both windows need one */
++static bool
++can_tab(struct view *view)
++{
++	return view->mapped && view->ssd_mode == LAB_SSD_MODE_FULL
++		&& !view_has_strut_partial(view);
++}
++
++static void
++update_decorations(struct tab_group *group)
++{
++	struct view *member;
++	wl_list_for_each(member, &group->members, tab_link) {
++		ssd_update_tabs(member->ssd);
++	}
++}
++
++/* Hidden members and unmapped views have no taskbar entry */
++static void
++update_foreign_toplevel(struct view *view)
++{
++	bool want = view->mapped && view_is_focusable(view)
++		&& window_rules_get_property(view, "skipTaskbar") != LAB_PROP_TRUE;
++	if (want && !view->foreign_toplevel) {
++		view->foreign_toplevel = foreign_toplevel_create(view);
++	} else if (!want && view->foreign_toplevel) {
++		foreign_toplevel_destroy(view->foreign_toplevel);
++		view->foreign_toplevel = NULL;
++	}
++}
++
++/*
++ * Make @view the active member of @group. It takes over the frame state,
++ * stacking position, taskbar entry and (if it had it) focus of the old one.
++ */
++static void
++set_active(struct tab_group *group, struct view *view)
++{
++	struct view *old = group->active;
++	if (old == view) {
++		return;
++	}
++	bool had_focus = old && server.active_view == old;
++	group->active = view;
++
++	if (old) {
++		view_take_frame_state(view, old);
++
++		/* Take the old member's place in the stacking order */
++		wl_list_remove(&view->link);
++		wl_list_insert(old->link.prev, &view->link);
++		if (view->scene_tree->node.parent == old->scene_tree->node.parent) {
++			wlr_scene_node_place_above(&view->scene_tree->node,
++				&old->scene_tree->node);
++		}
++
++		/* Keep the group's taskbar entry, now showing this tab */
++		if (old->foreign_toplevel) {
++			if (view->foreign_toplevel) {
++				foreign_toplevel_destroy(view->foreign_toplevel);
++			}
++			view->foreign_toplevel = old->foreign_toplevel;
++			old->foreign_toplevel = NULL;
++			foreign_toplevel_set_view(view->foreign_toplevel, view);
++		}
++	}
++
++	view_update_visibility(view);
++	update_foreign_toplevel(view);
++	if (old) {
++		view_update_visibility(old);
++		update_foreign_toplevel(old);
++	}
++	if (had_focus) {
++		desktop_focus_view(view, /*raise*/ false);
++	}
++	update_decorations(group);
++	cursor_update_focus();
++}
++
++static struct view *
++neighbour(struct view *view)
++{
++	struct tab_group *group = view->tab_group;
++	struct wl_list *next = view->tab_link.next;
++	if (next == &group->members) {
++		next = view->tab_link.prev;
++	}
++	if (next == &group->members) {
++		return NULL;
++	}
++	struct view *other = wl_container_of(next, other, tab_link);
++	return other == view ? NULL : other;
++}
++
++static void
++leave_group(struct view *view)
++{
++	struct tab_group *group = view->tab_group;
++	if (!group) {
++		return;
++	}
++	struct view *next = group->active == view ? neighbour(view) : NULL;
++
++	wl_list_remove(&view->tab_link);
++	wl_list_init(&view->tab_link);
++	view->tab_group = NULL;
++
++	if (next) {
++		set_active(group, next);
++	}
++	/* Show the view again and give it its own taskbar entry */
++	view_update_visibility(view);
++	update_foreign_toplevel(view);
++	ssd_update_tabs(view->ssd);
++
++	if (wl_list_length(&group->members) == 1) {
++		struct view *last =
++			wl_container_of(group->members.next, last, tab_link);
++		wl_list_remove(&last->tab_link);
++		wl_list_init(&last->tab_link);
++		last->tab_group = NULL;
++		ssd_update_tabs(last->ssd);
++		free(group);
++	} else if (!wl_list_empty(&group->members)) {
++		update_decorations(group);
++	} else {
++		free(group);
++	}
++}
++
++static void
++join(struct view *view, struct view *target, struct view *after, bool activate)
++{
++	if (target->tab_group) {
++		target = target->tab_group->active;
++	}
++	if (view == target || !can_tab(view) || !can_tab(target)
++			|| (view->tab_group && view->tab_group == target->tab_group)) {
++		return;
++	}
++	if (server.grabbed_view == view) {
++		interactive_cancel(view);
++	}
++	leave_group(view);
++
++	struct tab_group *group = target->tab_group;
++	if (!group) {
++		group = znew(*group);
++		wl_list_init(&group->members);
++		wl_list_insert(&group->members, &target->tab_link);
++		group->active = target;
++		target->tab_group = group;
++	}
++	if (after && after->tab_group == group) {
++		wl_list_insert(&after->tab_link, &view->tab_link);
++	} else {
++		wl_list_insert(group->members.prev, &view->tab_link);
++	}
++	view->tab_group = group;
++
++	if (activate) {
++		set_active(group, view);
++		return;
++	}
++
++	/* Join in the background, sized like the frame */
++	bool had_focus = server.active_view == view;
++	view_move_resize(view, group->active->pending);
++	view_update_visibility(view);
++	update_foreign_toplevel(view);
++	if (had_focus) {
++		desktop_focus_view(group->active, /*raise*/ false);
++	}
++	update_decorations(group);
++	cursor_update_focus();
++}
++
++void
++tabs_attach(struct view *view, struct view *target, struct view *after)
++{
++	assert(view);
++	assert(target);
++	join(view, target, after, /*activate*/ true);
++}
++
++void
++tabs_detach(struct view *view)
++{
++	assert(view);
++	leave_group(view);
++}
++
++void
++tabs_activate(struct view *view)
++{
++	assert(view);
++	if (view->tab_group && view->mapped) {
++		set_active(view->tab_group, view);
++	}
++}
++
++void
++tabs_cycle(struct view *view, int dir)
++{
++	if (!view || !view->tab_group) {
++		return;
++	}
++	struct tab_group *group = view->tab_group;
++	struct wl_list *link = &group->active->tab_link;
++	link = dir > 0 ? link->next : link->prev;
++	if (link == &group->members) {
++		link = dir > 0 ? link->next : link->prev;
++	}
++	struct view *next = wl_container_of(link, next, tab_link);
++	set_active(group, next);
++}
++
++void
++tabs_go_to(struct view *view, int index)
++{
++	if (!view || !view->tab_group || index == 0) {
++		return;
++	}
++	struct tab_group *group = view->tab_group;
++	int count = wl_list_length(&group->members);
++	if (index < 0) {
++		index += count + 1;
++	}
++	if (index < 1 || index > count) {
++		return;
++	}
++	struct view *member;
++	wl_list_for_each(member, &group->members, tab_link) {
++		if (--index == 0) {
++			set_active(group, member);
++			return;
++		}
++	}
++}
++
++void
++tabs_move(struct view *view, int dir)
++{
++	if (!view || !view->tab_group) {
++		return;
++	}
++	struct tab_group *group = view->tab_group;
++	view = group->active;
++	struct wl_list *link = &view->tab_link;
++	if (dir < 0 && link->prev != &group->members) {
++		struct wl_list *before = link->prev->prev;
++		wl_list_remove(link);
++		wl_list_insert(before, link);
++	} else if (dir > 0 && link->next != &group->members) {
++		struct wl_list *after = link->next;
++		wl_list_remove(link);
++		wl_list_insert(after, link);
++	} else {
++		return;
++	}
++	update_decorations(group);
++}
++
++/* The member a tab label or background stands for, if any */
++static struct view *
++tab_member_from_node(struct wlr_scene_node *node)
++{
++	if (!node || !node->data) {
++		return NULL;
++	}
++	struct node_descriptor *desc = node->data;
++	if (desc->type != LAB_NODE_TITLE || !desc->data) {
++		return NULL;
++	}
++	return desc->data;
++}
++
++void
++tabs_activate_at_cursor(struct cursor_context *ctx)
++{
++	if (!ctx || ctx->type != LAB_NODE_TITLE) {
++		return;
++	}
++	struct view *owner = ctx->view;
++	struct view *member = tab_member_from_node(ctx->node);
++	if (!member || !member->tab_group || !owner
++			|| member->tab_group != owner->tab_group
++			|| member == member->tab_group->active) {
++		return;
++	}
++	set_active(member->tab_group, member);
++
++	/*
++	 * The strip was rebuilt and the pressed view is now hidden. Re-point
++	 * the press at the new tab, so that a following Drag (Move) or Click
++	 * mousebind acts on it.
++	 */
++	struct cursor_context now = get_cursor_context();
++	if (server.seat.pressed.ctx.view == owner) {
++		cursor_context_save(&server.seat.pressed, &now);
++	}
++	if (server.grabbed_view == owner
++			&& server.input_mode == LAB_INPUT_STATE_PASSTHROUGH) {
++		server.grabbed_view = NULL;
++		interactive_set_grab_context(&now);
++	}
++	*ctx = now;
++}
++
++void
++tabs_group_with_window_below(struct view *view)
++{
++	if (!view) {
++		return;
++	}
++	if (view->tab_group) {
++		view = view->tab_group->active;
++	}
++	struct view *below = NULL, *fallback = NULL;
++	struct view *v = view;
++	while ((v = view_next(&server.views, v,
++			LAB_VIEW_CRITERIA_CURRENT_WORKSPACE))) {
++		if (v->minimized || !can_tab(v)
++				|| (view->tab_group && v->tab_group == view->tab_group)) {
++			continue;
++		}
++		if (!fallback) {
++			fallback = v;
++		}
++		struct wlr_box overlap;
++		if (wlr_box_intersection(&overlap, &view->current, &v->current)) {
++			below = v;
++			break;
++		}
++	}
++	struct view *other = below ? below : fallback;
++	if (!other) {
++		return;
++	}
++	/* Bring the other window (or its whole group) into this frame */
++	if (!other->tab_group) {
++		join(other, view, NULL, /*activate*/ false);
++		return;
++	}
++	struct wl_array members;
++	wl_array_init(&members);
++	struct view *member;
++	wl_list_for_each(member, &other->tab_group->members, tab_link) {
++		struct view **entry = wl_array_add(&members, sizeof(*entry));
++		if (entry) {
++			*entry = member;
++		}
++	}
++	struct view **entry;
++	wl_array_for_each(entry, &members) {
++		join(*entry, view, NULL, /*activate*/ false);
++	}
++	wl_array_release(&members);
++}
++
++bool
++tabs_join_by_identifier(struct view *view, const char *pattern)
++{
++	if (!view || !pattern || view->tab_group) {
++		return false;
++	}
++	struct view *v;
++	for_each_view(v, &server.views, LAB_VIEW_CRITERIA_CURRENT_WORKSPACE) {
++		if (v == view || v->minimized || !can_tab(v)) {
++			continue;
++		}
++		if (match_glob(pattern, v->app_id)) {
++			join(view, v, NULL, /*activate*/ true);
++			if (view->tab_group && server.active_view == view) {
++				view_move_to_front(view);
++			}
++			return view->tab_group;
++		}
++	}
++	return false;
++}
++
++/* Interactive tabbing */
++
++bool
++tabs_tabbing_active(void)
++{
++	return tabbing.view;
++}
++
++void
++tabs_start_tabbing(struct view *view)
++{
++	assert(view);
++	if (server.input_mode != LAB_INPUT_STATE_PASSTHROUGH
++			|| view != server.grabbed_view
++			|| view->fullscreen || !can_tab(view)) {
++		return;
++	}
++	tabbing.view = view;
++	seat_focus_override_begin(&server.seat, LAB_INPUT_STATE_MOVE,
++		LAB_CURSOR_GRAB);
++	tabs_tabbing_update();
++}
++
++void
++tabs_tabbing_update(void)
++{
++	struct view *view = tabbing.view;
++	if (!view) {
++		return;
++	}
++	if (!tabbing.outline) {
++		struct lab_scene_rect_options opts = {
++			.border_colors = (float *[3]) {
++				rc.theme->osd_bg_color,
++				rc.theme->osd_label_text_color,
++				rc.theme->osd_bg_color,
++			},
++			.nr_borders = 3,
++			.border_width = 1,
++		};
++		tabbing.outline = lab_scene_rect_create(server.menu_tree, &opts);
++	}
++	struct border margin = ssd_get_margin(view->ssd);
++	tabbing.geo = (struct wlr_box){
++		.x = server.grab_box.x + (server.seat.cursor->x - server.grab_x),
++		.y = server.grab_box.y + (server.seat.cursor->y - server.grab_y),
++		.width = server.grab_box.width,
++		.height = server.grab_box.height,
++	};
++	lab_scene_rect_set_size(tabbing.outline,
++		tabbing.geo.width + margin.left + margin.right,
++		tabbing.geo.height + margin.top + margin.bottom);
++	wlr_scene_node_set_position(&tabbing.outline->tree->node,
++		tabbing.geo.x - margin.left, tabbing.geo.y - margin.top);
++	wlr_scene_node_set_enabled(&tabbing.outline->tree->node, true);
++	wlr_scene_node_raise_to_top(&tabbing.outline->tree->node);
++}
++
++void
++tabs_tabbing_cancel(void)
++{
++	tabbing.view = NULL;
++	if (tabbing.outline) {
++		wlr_scene_node_destroy(&tabbing.outline->tree->node);
++		tabbing.outline = NULL;
++	}
++}
++
++/*
++ * Dropped on another window's titlebar: join that group as its active tab,
++ * next to the tab under the cursor. Dropped anywhere else: leave the group
++ * (if any) and move to the outline.
++ */
++void
++tabs_tabbing_finish(struct view *view)
++{
++	struct wlr_box geo = tabbing.geo;
++	struct cursor_context ctx = get_cursor_context();
++	tabs_tabbing_cancel();
++	interactive_cancel(view);
++
++	struct view *target = ctx.view;
++	if (target && target != view
++			&& node_type_contains(LAB_NODE_TITLEBAR, ctx.type)) {
++		if (view->tab_group && target->tab_group == view->tab_group) {
++			return;
++		}
++		struct view *after = tab_member_from_node(ctx.node);
++		tabs_attach(view, target, after);
++		if (view->tab_group) {
++			desktop_focus_view(view, /*raise*/ true);
++		}
++		return;
++	}
++	if (view->tab_group) {
++		leave_group(view);
++		desktop_focus_view(view, /*raise*/ true);
++	}
++	if (view_is_floating(view)) {
++		view_move(view, geo.x, geo.y);
++	}
++}
++
++/* Hooks */
++
++void
++tabs_on_unmap(struct view *view)
++{
++	if (tabbing.view == view) {
++		tabs_tabbing_cancel();
++	}
++	leave_group(view);
++}
++
++/* Keep hidden members sized like the frame so a switch shows no stale size */
++void
++tabs_on_moved(struct view *view)
++{
++	struct tab_group *group = view->tab_group;
++	if (!group || group->active != view) {
++		return;
++	}
++	struct view *member;
++	wl_list_for_each(member, &group->members, tab_link) {
++		if (member != view && member->mapped
++				&& !wlr_box_equal(&member->pending, &view->pending)) {
++			view_move_resize(member, view->pending);
++		}
++	}
++}
++
++void
++tabs_on_title_changed(struct view *view)
++{
++	if (view->tab_group) {
++		update_decorations(view->tab_group);
++	}
++}
+diff --git a/src/view-impl-common.c b/src/view-impl-common.c
+index 092ca55..e9ec80d 100644
+--- a/src/view-impl-common.c
++++ b/src/view-impl-common.c
+@@ -3,6 +3,7 @@
+ #include "view-impl-common.h"
+ #include "foreign-toplevel/foreign.h"
+ #include "labwc.h"
++#include "tabs.h"
+ #include "view.h"
+ #include "window-rules.h"
+ 
+@@ -44,6 +45,8 @@ view_impl_map(struct view *view)
+ void
+ view_impl_unmap(struct view *view)
+ {
++	/* An unmapped view leaves its tab group, handing the frame on */
++	tabs_on_unmap(view);
+ 	view_update_visibility(view);
+ 
+ 	/*
+diff --git a/src/view.c b/src/view.c
+index 21005f2..727907e 100644
+--- a/src/view.c
++++ b/src/view.c
+@@ -29,6 +29,7 @@
+ #include "snap-constraints.h"
+ #include "snap.h"
+ #include "ssd.h"
++#include "tabs.h"
+ #include "theme.h"
+ #include "window-rules.h"
+ #include "wlr/util/log.h"
+@@ -368,7 +369,7 @@ bool
+ view_is_focusable(struct view *view)
+ {
+ 	assert(view);
+-	if (!view->surface) {
++	if (!view->surface || view_is_hidden_tab(view)) {
+ 		return false;
+ 	}
+ 
+@@ -567,6 +568,7 @@ view_moved(struct view *view)
+ 	if (rc.resize_indicator && server.grabbed_view == view) {
+ 		resize_indicator_update(view);
+ 	}
++	tabs_on_moved(view);
+ }
+ 
+ void
+@@ -2300,6 +2302,7 @@ view_set_title(struct view *view, const char *title)
+ 	xstrdup_replace(view->title, title);
+ 
+ 	ssd_update_title(view->ssd);
++	tabs_on_title_changed(view);
+ 	wl_signal_emit_mutable(&view->events.new_title, NULL);
+ }
+ 
+@@ -2374,7 +2377,8 @@ mappable_disconnect(struct mappable *mappable)
+ void
+ view_update_visibility(struct view *view)
+ {
+-	bool visible = view->mapped && !view->minimized;
++	bool visible = view->mapped && !view->minimized
++		&& !view_is_hidden_tab(view);
+ 	if (visible == view->scene_tree->node.enabled) {
+ 		return;
+ 	}
+@@ -2441,6 +2445,46 @@ view_set_shade(struct view *view, bool shaded)
+ 	}
+ }
+ 
++void
++view_take_frame_state(struct view *view, struct view *from)
++{
++	assert(view);
++	assert(from);
++	assert(view != from);
++
++	view_move_to_workspace(view, from->workspace);
++	view_set_layer(view, from->layer);
++	if (view->visible_on_all_workspaces != from->visible_on_all_workspaces) {
++		view_toggle_visible_on_all_workspaces(view);
++	}
++	if (output_is_usable(from->output)) {
++		view->output = from->output;
++	}
++
++	view_set_shade(view, false);
++	if (view->fullscreen != from->fullscreen) {
++		set_fullscreen(view, from->fullscreen);
++		output_set_has_fullscreen_view(view->output, view->fullscreen);
++	}
++	view_set_maximized(view, from->maximized);
++	view->tiled = from->tiled;
++	view->tiled_region = from->tiled_region;
++	zfree(view->tiled_region_evacuate);
++	if (from->tiled_region_evacuate) {
++		view->tiled_region_evacuate = xstrdup(from->tiled_region_evacuate);
++	}
++	view_notify_tiled(view);
++	view->natural_geometry = view_is_floating(from) ?
++		from->pending : from->natural_geometry;
++	view_move_resize(view, from->pending);
++	if (from->shaded) {
++		view_set_shade(view, true);
++	}
++
++	bool need_refocus = false;
++	_minimize(view, from->minimized, &need_refocus);
++}
++
+ void
+ view_set_icon(struct view *view, const char *icon_name, struct wl_array *buffers)
+ {
+@@ -2479,6 +2523,7 @@ view_init(struct view *view)
+ 	wl_signal_init(&view->events.always_on_top);
+ 	wl_signal_init(&view->events.set_icon);
+ 	wl_signal_init(&view->events.destroy);
++	wl_list_init(&view->tab_link);
+ 
+ 	view->title = xstrdup("");
+ 	view->app_id = xstrdup("");
+@@ -2495,6 +2540,7 @@ view_destroy(struct view *view)
+ 
+ 	wl_signal_emit_mutable(&view->events.destroy, NULL);
+ 	snap_constraints_invalidate(view);
++	tabs_on_unmap(view);
+ 
+ 	if (view->mappable.connected) {
+ 		mappable_disconnect(&view->mappable);

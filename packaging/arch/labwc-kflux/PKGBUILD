@@ -1,0 +1,50 @@
+# Maintainer: kflux contributors
+# labwc with Fluxbox-style window tabs: upstream labwc plus kflux's
+# third_party/patches/labwc-tabs.patch (decisions/0004-tabs-in-labwc.md).
+# Replaces the labwc package; tracks upstream labwc releases (pkgver).
+# Before publishing: tag v$_kfluxver, replace the kflux sha256sum.
+# Local test: KFLUX_SRC=file:///path/kflux.tar.gz makepkg -f
+# build/container/build-image.sh builds the image's copy this way.
+_owner=endthestart
+pkgname=labwc-kflux
+pkgver=0.20.2
+pkgrel=1
+_kfluxver=0.1.0
+pkgdesc='Stacking Wayland compositor with the look and feel of Openbox, plus Fluxbox-style window tabs (kflux)'
+arch=('x86_64')
+url='https://github.com/labwc/labwc'
+license=('GPL-2.0-only')
+depends=(
+  'cairo' 'glib2' 'glibc' 'libinput' 'libpng' 'librsvg' 'libsfdo'
+  'libwlroots-0.20.so' 'libxcb' 'libxkbcommon' 'libxml2' 'pango' 'pixman'
+  'seatd' 'ttf-font' 'wayland'
+)
+makedepends=('meson' 'scdoc' 'wayland-protocols' 'xorg-xwayland')
+optdepends=(
+  'bemenu: default launcher via Alt+F3'
+  'xorg-xwayland: X11 application support'
+)
+provides=("labwc=${pkgver}")
+conflicts=('labwc')
+_labwc_src="${LABWC_SRC:-https://github.com/labwc/labwc/archive/refs/tags/${pkgver}.tar.gz}"
+_kflux_src="${KFLUX_SRC:-https://github.com/${_owner}/kflux/archive/refs/tags/v${_kfluxver}.tar.gz}"
+source=("labwc-${pkgver}.tar.gz::${_labwc_src}"
+        "kflux-${_kfluxver}.tar.gz::${_kflux_src}")
+sha256sums=('fae023b6fe022f7057556707a17cdb2d98e0138c5dffaedaa1dade975699f9e8'
+            'SKIP')
+
+prepare() {
+  cd "labwc-${pkgver}"
+  patch -Np1 -i "../kflux-${_kfluxver}/third_party/patches/labwc-tabs.patch"
+}
+
+build() {
+  arch-meson -Dman-pages=enabled "labwc-${pkgver}" build
+  # gcc occasionally segfaults in an emulated x86_64 builder (the image build
+  # on Apple Silicon); later runs resume where the first stopped.
+  meson compile -C build || meson compile -C build || meson compile -C build
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+}

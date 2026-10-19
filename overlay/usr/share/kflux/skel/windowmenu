@@ -1,0 +1,13 @@
+# kflux window menu -- Fluxbox windowmenu syntax (right-click a titlebar)
+[begin]
+  [shade]
+  [stick]
+  [maximize]
+  [iconify]
+  [raise]
+  [lower]
+  [sendto]
+  [layer]
+  [separator]
+  [close]
+[end]

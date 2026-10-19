@@ -1,0 +1,12 @@
+# kflux: log straight into the kflux session at boot (PoC autologin);
+# after logout, tuigreet offers kflux, Plasma (fallback) and plain labwc.
+[terminal]
+vt = 1
+
+[initial_session]
+command = "kflux-session"
+user = "flux"
+
+[default_session]
+command = "tuigreet --time --remember-session --sessions /usr/share/wayland-sessions --cmd kflux-session"
+user = "greeter"

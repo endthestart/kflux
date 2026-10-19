@@ -1,0 +1,2699 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 kflux contributors
+"""kflux - Fluxbox-style configuration for a labwc + KDE desktop.
+
+The user edits Fluxbox-format files in ~/.config/kflux:
+
+    init        session.* resources (toolbar, slit, workspaces, focus, style)
+    keys        Fluxbox keys file (keyboard and mouse bindings)
+    apps        Fluxbox apps file (per-window rules, [startup] entries)
+    menu        Fluxbox root menu
+    windowmenu  Fluxbox window menu
+    slitlist    kflux "dockapps" shown in the slit, one per line
+    startup     shell lines run when the session starts
+
+and any Fluxbox style (file or directory with theme.cfg). `kflux apply`
+renders them into labwc (rc.xml, menu.xml, autostart, theme + SVG buttons),
+Waybar (toolbar + slit), mako, swaylock, a wallpaper and a KDE colour scheme,
+then reloads the running session.
+"""
+import argparse
+import colorsys
+import fnmatch
+import glob
+import html
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import zlib
+
+HOME = os.path.expanduser("~")
+XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config"))
+XDG_DATA = os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local/share"))
+XDG_CACHE = os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache"))
+KFLUX = os.path.join(XDG_CONFIG, "kflux")
+SYSTEM = os.environ.get("KFLUX_SYSTEM", "/usr/share/kflux")
+FLUXBOX_STYLES = os.environ.get("KFLUX_FLUXBOX_STYLES", "/usr/share/fluxbox/styles")
+GEN_THEME = "kflux-current"
+VERSION = "0.1.0"
+STYLE_DIRS = [os.path.join(KFLUX, "styles"), os.path.join(SYSTEM, "styles"), FLUXBOX_STYLES]
+WARNINGS = []
+
+
+def warn(msg):
+    WARNINGS.append(msg)
+
+
+def esc(s):
+    return html.escape(str(s), quote=True)
+
+
+def mlabel(s):
+    """Menu label: labwc treats '_' as an accelerator marker; '__' is a literal."""
+    return esc(str(s).replace("_", "__"))
+
+
+def write(path, text, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def expand(p):
+    if not p:
+        return p
+    p = p.strip()
+    if p.startswith("~/.config/"):  # honour XDG_CONFIG_HOME for config paths
+        p = os.path.join(XDG_CONFIG, p[len("~/.config/"):])
+    return os.path.expandvars(os.path.expanduser(p))
+
+
+# --------------------------------------------------------------------------
+# X resource database (init files and styles share this syntax)
+# --------------------------------------------------------------------------
+
+class ResourceDB:
+    """Minimal Xrm-style database: `pattern: value` with `*` loose bindings."""
+
+    def __init__(self):
+        self.entries = []  # (pattern components, value, order)
+
+    @classmethod
+    def load(cls, path):
+        db = cls()
+        if path and os.path.isfile(path):
+            with open(path, encoding="utf-8", errors="replace") as f:
+                db.parse(f.read())
+        return db
+
+    def parse(self, text):
+        text = re.sub(r"\\\n", "", text)
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line[0] in "!#":
+                continue
+            if ":" not in line:
+                continue
+            key, val = line.split(":", 1)
+            key = key.strip()
+            val = val.strip()
+            comps = re.split(r"(\*|\.)", key)
+            pat = []
+            loose = False
+            for c in comps:
+                if c == "*":
+                    loose = True
+                elif c == "." or c == "":
+                    continue
+                else:
+                    pat.append(("*" if loose else ".", c.lower()))
+                    loose = False
+            if loose:
+                pat.append(("*", "?"))
+            self.entries.append((pat, val, len(self.entries)))
+
+    @staticmethod
+    def _match(pat, name):
+        # Returns a specificity tuple or None. Earlier exact components win.
+        def rec(pi, ni):
+            if pi == len(pat):
+                return () if ni == len(name) else None
+            binding, comp = pat[pi]
+            best = None
+            starts = [ni] if binding == "." else range(ni, len(name))
+            for s in starts:
+                if s >= len(name):
+                    break
+                if comp == "?" or comp == name[s]:
+                    rest = rec(pi + 1, s + 1)
+                    if rest is not None:
+                        score = ((2 if binding == "." and comp != "?" else
+                                  1 if comp != "?" else 0),) + rest
+                        # Skipped components count as weakest matches.
+                        score = (0,) * (s - ni) + score
+                        if best is None or score > best:
+                            best = score
+            return best
+        return rec(0, 0)
+
+    def get(self, key, default=None):
+        name = key.lower().split(".")
+        best, bestval = None, default
+        for pat, val, order in self.entries:
+            sc = self._match(pat, name)
+            if sc is None:
+                continue
+            sc = sc + (order,)
+            if best is None or sc > best:
+                best, bestval = sc, val
+        return bestval
+
+    def first(self, *keys, default=None):
+        for k in keys:
+            v = self.get(k)
+            if v not in (None, ""):
+                return v
+        return default
+
+
+# --------------------------------------------------------------------------
+# Colours
+# --------------------------------------------------------------------------
+
+X11_COLORS = {
+    "black": "000000", "white": "ffffff", "red": "ff0000", "green": "00ff00",
+    "blue": "0000ff", "yellow": "ffff00", "cyan": "00ffff", "magenta": "ff00ff",
+    "gray": "bebebe", "grey": "bebebe", "darkgray": "a9a9a9", "darkgrey": "a9a9a9",
+    "lightgray": "d3d3d3", "lightgrey": "d3d3d3", "dimgray": "696969", "dimgrey": "696969",
+    "slategray": "708090", "slategrey": "708090", "lightslategray": "778899",
+    "darkslategray": "2f4f4f", "darkslategrey": "2f4f4f", "steelblue": "4682b4",
+    "lightsteelblue": "b0c4de", "navy": "000080", "navyblue": "000080",
+    "midnightblue": "191970", "royalblue": "4169e1", "skyblue": "87ceeb",
+    "lightblue": "add8e6", "dodgerblue": "1e90ff", "cornflowerblue": "6495ed",
+    "darkblue": "00008b", "slateblue": "6a5acd", "darkslateblue": "483d8b",
+    "orange": "ffa500", "darkorange": "ff8c00", "gold": "ffd700", "khaki": "f0e68c",
+    "darkkhaki": "bdb76b", "beige": "f5f5dc", "bisque": "ffe4c4", "wheat": "f5deb3",
+    "tan": "d2b48c", "brown": "a52a2a", "maroon": "b03060", "firebrick": "b22222",
+    "darkred": "8b0000", "pink": "ffc0cb", "hotpink": "ff69b4", "purple": "a020f0",
+    "violet": "ee82ee", "orchid": "da70d6", "plum": "dda0dd", "seagreen": "2e8b57",
+    "darkgreen": "006400", "darkolivegreen": "556b2f", "olivedrab": "6b8e23",
+    "forestgreen": "228b22", "limegreen": "32cd32", "palegreen": "98fb98",
+    "lightseagreen": "20b2aa", "teal": "008080", "turquoise": "40e0d0",
+    "aquamarine": "7fffd4", "ivory": "fffff0", "snow": "fffafa", "linen": "faf0e6",
+    "lavender": "e6e6fa", "gainsboro": "dcdcdc", "whitesmoke": "f5f5f5",
+    "silver": "c0c0c0", "lemonchiffon": "fffacd", "peachpuff": "ffdab9",
+    "cadetblue": "5f9ea0", "powderblue": "b0e0e6", "chocolate": "d2691e",
+    "sienna": "a0522d", "peru": "cd853f", "burlywood": "deb887", "salmon": "fa8072",
+    "tomato": "ff6347", "coral": "ff7f50", "indianred": "cd5c5c", "darkcyan": "008b8b",
+    "darkmagenta": "8b008b", "lightyellow": "ffffe0", "honeydew": "f0fff0",
+    "mintcream": "f5fffa", "azure": "f0ffff", "aliceblue": "f0f8ff",
+    "ghostwhite": "f8f8ff", "oldlace": "fdf5e6", "antiquewhite": "faebd7",
+    "seashell": "fff5ee", "mistyrose": "ffe4e1", "papayawhip": "ffefd5",
+    "blanchedalmond": "ffebcd", "cornsilk": "fff8dc", "navajowhite": "ffdead",
+    "moccasin": "ffe4b5", "rosybrown": "bc8f8f", "goldenrod": "daa520",
+    "darkgoldenrod": "b8860b", "lightgoldenrod": "eedd82", "palegoldenrod": "eee8aa",
+    "yellowgreen": "9acd32", "chartreuse": "7fff00", "lawngreen": "7cfc00",
+    "springgreen": "00ff7f", "mediumseagreen": "3cb371", "darkseagreen": "8fbc8f",
+    "lightcyan": "e0ffff", "paleturquoise": "afeeee", "darkturquoise": "00ced1",
+    "mediumturquoise": "48d1cc", "deepskyblue": "00bfff", "lightskyblue": "87cefa",
+    "mediumblue": "0000cd", "mediumslateblue": "7b68ee", "lightslateblue": "8470ff",
+    "blueviolet": "8a2be2", "darkviolet": "9400d3", "darkorchid": "9932cc",
+    "mediumorchid": "ba55d3", "mediumpurple": "9370db", "thistle": "d8bfd8",
+    "deeppink": "ff1493", "palevioletred": "db7093", "mediumvioletred": "c71585",
+    "violetred": "d02090", "orangered": "ff4500", "lightcoral": "f08080",
+    "darksalmon": "e9967a", "lightsalmon": "ffa07a", "sandybrown": "f4a460",
+    "saddlebrown": "8b4513", "lightpink": "ffb6c1",
+}
+_RGB_TXT = None
+
+
+def _rgb_txt():
+    global _RGB_TXT
+    if _RGB_TXT is None:
+        _RGB_TXT = {}
+        for p in ("/usr/share/X11/rgb.txt", "/usr/share/X11/rgb/rgb.txt"):
+            if os.path.isfile(p):
+                for line in open(p, errors="replace"):
+                    m = re.match(r"\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+)", line)
+                    if m:
+                        name = m.group(4).strip().lower().replace(" ", "")
+                        _RGB_TXT[name] = "%02x%02x%02x" % tuple(int(m.group(i)) for i in (1, 2, 3))
+                break
+    return _RGB_TXT
+
+
+def parse_color(s, default=None):
+    """Fluxbox/X11 colour -> '#rrggbb'."""
+    if not s or s.strip() in ("#", "none", "None"):
+        return default
+    s = s.strip().split()[0] if s.strip().startswith("#") else s.strip()
+    m = re.fullmatch(r"#([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{12})", s)
+    if m:
+        h = m.group(1)
+        if len(h) == 3:
+            h = "".join(c * 2 for c in h)
+        elif len(h) == 12:
+            h = h[0:2] + h[4:6] + h[8:10]
+        return "#" + h.lower()
+    m = re.fullmatch(r"rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)", s)
+    if m:
+        def ch(x):
+            return int(x, 16) * 255 // (16 ** len(x) - 1)
+        return "#%02x%02x%02x" % tuple(ch(m.group(i)) for i in (1, 2, 3))
+    name = s.lower().replace(" ", "")
+    if name in _rgb_txt():
+        return "#" + _rgb_txt()[name]
+    m = re.fullmatch(r"gr[ae]y(\d{1,3})", name)
+    if m:
+        v = round(int(m.group(1)) * 255 / 100)
+        return "#%02x%02x%02x" % (v, v, v)
+    if name in X11_COLORS:
+        return "#" + X11_COLORS[name]
+    m = re.fullmatch(r"([a-z]+)([1-4])", name)  # e.g. steelblue3
+    if m and m.group(1) in X11_COLORS:
+        f = {"1": 1.0, "2": 0.93, "3": 0.80, "4": 0.55}[m.group(2)]
+        return shade("#" + X11_COLORS[m.group(1)], f)
+    warn("unknown colour %r" % s)
+    return default
+
+
+def rgb(c):
+    c = c.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def hexc(r, g, b):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, round(v))) for v in (r, g, b))
+
+
+def shade(c, f):
+    r, g, b = rgb(c)
+    return hexc(r * f, g * f, b * f)
+
+
+def mix(a, b, t):
+    ra, ga, ba = rgb(a)
+    rb, gb, bb = rgb(b)
+    return hexc(ra + (rb - ra) * t, ga + (gb - ga) * t, ba + (bb - ba) * t)
+
+
+def lighten(c, t):
+    return mix(c, "#ffffff", t)
+
+
+def darken(c, t):
+    return mix(c, "#000000", t)
+
+
+def luminance(c):
+    def lin(v):
+        v /= 255
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = rgb(c)
+    return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+
+
+def contrast(a, b):
+    la, lb = sorted((luminance(a), luminance(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def readable(fg, bg):
+    if fg and contrast(fg, bg) >= 2.5:
+        return fg
+    return "#000000" if luminance(bg) > 0.35 else "#ffffff"
+
+
+# --------------------------------------------------------------------------
+# Styles
+# --------------------------------------------------------------------------
+
+class Texture:
+    def __init__(self, spec, color, color_to, pic=None, text=None):
+        spec = (spec or "Flat Solid").lower()
+        self.spec = spec
+        self.relief = "raised" if "raised" in spec else "sunken" if "sunken" in spec else "flat"
+        self.parent = "parentrelative" in spec
+        self.gradient = None
+        if "gradient" in spec:
+            for g in ("crossdiagonal", "diagonal", "horizontal", "vertical", "pipecross",
+                      "elliptic", "rectangle", "pyramid", "splitvertical",
+                      "mirrorhorizontal"):
+                if g in spec:
+                    self.gradient = g
+                    break
+            self.gradient = self.gradient or "diagonal"
+        self.interlaced = "interlaced" in spec
+        self.bevel2 = "bevel2" in spec
+        self.color = color or "#808080"
+        self.color_to = color_to or self.color
+        self.pic = pic
+        self.text = text
+
+    def mid(self):
+        return mix(self.color, self.color_to, 0.5) if self.gradient else self.color
+
+    def css(self, border=True):
+        """GTK CSS declarations for this texture."""
+        if self.parent:
+            out = ["background: transparent;"]
+        elif self.gradient:
+            a, b = self.color, self.color_to
+            g = self.gradient
+            if g == "vertical":
+                img = "linear-gradient(to bottom, %s, %s)" % (a, b)
+            elif g == "horizontal":
+                img = "linear-gradient(to right, %s, %s)" % (a, b)
+            elif g == "diagonal":
+                img = "linear-gradient(to bottom right, %s, %s)" % (a, b)
+            elif g == "crossdiagonal":
+                img = "linear-gradient(to bottom left, %s, %s)" % (a, b)
+            elif g == "splitvertical":
+                img = "linear-gradient(to bottom, %s, %s 50%%, %s 50%%, %s)" % (
+                    lighten(a, .15), a, b, lighten(b, .1))
+            elif g == "mirrorhorizontal":
+                img = "linear-gradient(to right, %s, %s 50%%, %s)" % (a, b, a)
+            else:  # pipecross, elliptic, rectangle, pyramid
+                img = "radial-gradient(ellipse at center, %s, %s)" % (b, a)
+            if self.interlaced:
+                img = ("repeating-linear-gradient(to bottom, rgba(0,0,0,0) 0px, rgba(0,0,0,0) 1px, "
+                       "rgba(0,0,0,0.10) 1px, rgba(0,0,0,0.10) 2px), " + img)
+            out = ["background-color: %s;" % self.mid(), "background-image: %s;" % img]
+        else:
+            out = ["background-color: %s;" % self.color, "background-image: none;"]
+            if self.interlaced:
+                out[1] = ("background-image: repeating-linear-gradient(to bottom, rgba(0,0,0,0) 0px, "
+                          "rgba(0,0,0,0) 1px, rgba(0,0,0,0.10) 1px, rgba(0,0,0,0.10) 2px);")
+        if border and not self.parent and self.relief != "flat":
+            base = self.mid()
+            hi, lo = lighten(base, .35), darken(base, .45)
+            if self.relief == "sunken":
+                hi, lo = lo, hi
+            w = 2 if self.bevel2 else 1
+            out.append("border-style: solid; border-width: %dpx; "
+                       "border-color: %s %s %s %s;" % (w, hi, lo, lo, hi))
+        return " ".join(out)
+
+    def labwc(self, prefix):
+        """labwc themerc lines (labwc supports Solid, Vertical, SplitVertical)."""
+        if self.parent:
+            return ["%s: Solid" % prefix, "%s.color: %s" % (prefix, self.color)]
+        if not self.gradient or self.color == self.color_to:
+            return ["%s: Solid" % prefix, "%s.color: %s" % (prefix, self.color)]
+        a, b = self.color, self.color_to
+        if self.gradient in ("horizontal", "mirrorhorizontal", "crossdiagonal"):
+            # No horizontal gradients in labwc; keep the palette, rotate the ramp.
+            pass
+        if self.gradient == "splitvertical" or self.relief == "raised":
+            return ["%s: Gradient SplitVertical" % prefix,
+                    "%s.color: %s" % (prefix, a), "%s.colorTo: %s" % (prefix, b),
+                    "%s.color.splitTo: %s" % (prefix, lighten(a, .18)),
+                    "%s.colorTo.splitTo: %s" % (prefix, lighten(b, .08))]
+        return ["%s: Gradient Vertical" % prefix,
+                "%s.color: %s" % (prefix, a), "%s.colorTo: %s" % (prefix, b)]
+
+
+FONT_MAP = [
+    # artwiz bitmap fonts were the peak-Fluxbox look; Terminus is the closest
+    # freely licensed (OFL) bitmap-style face.
+    (r"^(snap|lime|glisp|anorexia|aqui|nu|gelly|drift|cure|edges|kates|mintsmild|"
+     r"smoothansi|fkp|cursor|artwiz.*|proggy.*|fixed|terminus|clean|profont|"
+     r"tamsyn|lemon|tewi|ohsnap.*)$", "Terminess Nerd Font,Terminus,monospace", 9),
+    (r"^(lucidatypewriter|courier|monospace|mono|dejavu sans mono|"
+     r"bitstream vera sans mono|andale mono)$", "DejaVu Sans Mono,monospace", None),
+    (r".*", "DejaVu Sans,Noto Sans,sans-serif", None),
+]
+
+
+def parse_font(spec, default_size=9):
+    """Fluxbox font spec (xft 'family-size:bold:shadow...' or XLFD) -> dict."""
+    fam, size, bold = "sans", default_size, False
+    if spec:
+        spec = spec.strip()
+        if spec.startswith("-"):
+            f = spec.split("-")
+            fam = f[2] if len(f) > 2 and f[2] not in ("*", "") else "fixed"
+            bold = len(f) > 3 and "bold" in f[3].lower()
+            try:
+                px = int(f[7]) if len(f) > 7 and f[7].isdigit() else 0
+                pt = int(f[8]) // 10 if len(f) > 8 and f[8].isdigit() else 0
+                size = pt or (round(px * 0.75) if px else default_size)
+            except ValueError:
+                pass
+        else:
+            parts = spec.split(":")
+            head = parts[0]
+            bold = any(p.strip().lower() == "bold" for p in parts[1:])
+            m = re.match(r"(.*?)-(\d+(?:\.\d+)?)$", head)
+            if m:
+                fam, size = m.group(1), float(m.group(2))
+            else:
+                fam = head
+            if "bold" in fam.lower():
+                bold = True
+                fam = re.sub(r"(?i)[ -]?bold", "", fam)
+    key = fam.strip().lower()
+    for pat, family, forced in FONT_MAP:
+        if re.match(pat, key):
+            out_size = forced if forced and size <= 10 else size
+            return {"family": family, "size": round(float(out_size)), "bold": bold}
+    return {"family": "sans-serif", "size": default_size, "bold": bold}
+
+
+def find_style(name):
+    if not name:
+        return None
+    p = expand(name)
+    if os.path.exists(p):
+        return p
+    for d in STYLE_DIRS:
+        cand = os.path.join(d, name)
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def style_file(path):
+    if os.path.isdir(path):
+        for n in ("theme.cfg", "style.cfg"):
+            if os.path.isfile(os.path.join(path, n)):
+                return os.path.join(path, n)
+        return None
+    return path
+
+
+class Style:
+    def __init__(self, path):
+        self.path = path
+        self.name = os.path.basename(path.rstrip("/"))
+        self.db = ResourceDB.load(style_file(path))
+        self._resolve()
+
+    def color(self, *keys, default=None):
+        return parse_color(self.db.first(*keys), default)
+
+    def tex(self, key, fallbacks=(), default_color="#808080", text_default=None):
+        keys = (key,) + tuple(fallbacks)
+        spec, base = None, key
+        for k in keys:
+            v = self.db.get(k)
+            if v and not v.startswith("#") and re.search(
+                    r"(?i)flat|raised|sunken|solid|gradient|parentrelative|pixmap", v):
+                spec, base = v, k
+                break
+        color = self.color(base + ".color", *[k + ".color" for k in keys], default=default_color)
+        color_to = self.color(base + ".colorTo", *[k + ".colorTo" for k in keys], default=None)
+        pic = self.color(base + ".picColor", *[k + ".picColor" for k in keys], default=None)
+        text = self.color(base + ".textColor", *[k + ".textColor" for k in keys],
+                          default=text_default)
+        if spec is None:
+            spec = "Flat Gradient Vertical" if color_to and color_to != color else "Flat Solid"
+        return Texture(spec, color, color_to, pic, text)
+
+    def _resolve(self):
+        s = self
+        self.toolbar = s.tex("toolbar", default_color="#3c3c3c")
+        tb_text = s.color("toolbar.textColor", "toolbar.label.textColor",
+                          "toolbar.clock.textColor", default="#dddddd")
+        self.workspace = s.tex("toolbar.workspace", ("toolbar.label",),
+                               self.toolbar.color, tb_text)
+        self.clock = s.tex("toolbar.clock", (), self.toolbar.color, tb_text)
+        self.ib_focused = s.tex("toolbar.iconbar.focused", ("toolbar.windowLabel",),
+                                self.toolbar.color, tb_text)
+        self.ib_unfocused = s.tex("toolbar.iconbar.unfocused", ("toolbar",),
+                                  self.toolbar.color, tb_text)
+        self.ib_empty = s.tex("toolbar.iconbar.empty", ("toolbar",), self.toolbar.color)
+        if self.db.get("toolbar.iconbar.empty") is None:
+            self.ib_empty.parent = True
+        self.tb_button = s.tex("toolbar.button", ("toolbar.label", "toolbar"),
+                               self.toolbar.color)
+        self.tb_button.pic = self.tb_button.pic or s.color(
+            "toolbar.button.picColor", default=tb_text)
+        for t in (self.workspace, self.clock, self.ib_focused, self.ib_unfocused):
+            t.text = t.text or tb_text
+        self.toolbar.text = tb_text
+        self.slit = s.tex("slit", ("toolbar",), self.toolbar.color)
+
+        self.title_f = s.tex("window.title.focus", (), "#5a6a7a")
+        self.title_u = s.tex("window.title.unfocus", (), "#9a9a9a")
+        self.label_f = s.tex("window.label.focus", ("window.title.focus",), self.title_f.color)
+        self.label_u = s.tex("window.label.unfocus", ("window.title.unfocus",), self.title_u.color)
+        self.text_f = s.color("window.label.focus.textColor", "window.title.focus.textColor",
+                              default="#ffffff")
+        self.text_u = s.color("window.label.unfocus.textColor",
+                              "window.title.unfocus.textColor", default="#202020")
+        self.btn_f = s.tex("window.button.focus", ("window.title.focus",), self.title_f.color)
+        self.btn_u = s.tex("window.button.unfocus", ("window.title.unfocus",), self.title_u.color)
+        self.pic_f = s.color("window.button.focus.picColor", default=self.text_f)
+        self.pic_u = s.color("window.button.unfocus.picColor", default=self.text_u)
+        self.border_w = int(re.sub(r"\D", "", s.db.first(
+            "window.borderWidth", "borderWidth", default="1")) or 1)
+        self.border_c = s.color("window.borderColor", "borderColor", default="#000000")
+        self.frame_f = s.color("window.frame.focusColor", default=self.border_c)
+        self.frame_u = s.color("window.frame.unfocusColor", default=self.border_c)
+        self.win_font = parse_font(s.db.first("window.font", "window.label.focus.font"))
+        self.justify = (s.db.first("window.justify", "window.label.focus.justify",
+                                   default="center") or "center").capitalize()
+
+        self.menu_title = s.tex("menu.title", (), "#5a6a7a")
+        self.menu_title_text = s.color("menu.title.textColor", default="#ffffff")
+        self.menu_frame = s.tex("menu.frame", (), "#e0e0e0")
+        self.menu_text = s.color("menu.frame.textColor", default="#000000")
+        self.menu_disable = s.color("menu.frame.disableColor",
+                                    default=mix(self.menu_text, self.menu_frame.mid(), .5))
+        self.menu_hilite = s.tex("menu.hilite", (), "#5a6a7a")
+        self.menu_hilite_text = s.color("menu.hilite.textColor", default="#ffffff")
+        self.menu_border_c = s.color("menu.borderColor", "borderColor", default=self.border_c)
+        self.menu_border_w = int(re.sub(r"\D", "", s.db.first(
+            "menu.borderWidth", "borderWidth", default="1")) or 1)
+        self.menu_font = parse_font(s.db.first("menu.frame.font", "menu.font"))
+        self.menu_title_font = parse_font(s.db.first("menu.title.font", "menu.frame.font"))
+        self.tb_font = parse_font(s.db.first("toolbar.font", "toolbar.clock.font",
+                                             "toolbar.iconbar.focused.font", "window.font"))
+        self.bevel = int(re.sub(r"\D", "", s.db.first(
+            "toolbar.bevelWidth", "bevelWidth", default="1")) or 1)
+        self.background = self._background()
+
+    def _background(self):
+        """-> ('solid', c) | ('gradient', a, b, kind) | ('image', path, mode)."""
+        db = self.db
+        kind = (db.get("background") or "").lower()
+        if kind and kind not in ("none", "unset"):
+            pix = expand(db.get("background.pixmap") or "")
+            if pix:
+                base = os.path.dirname(style_file(self.path) or self.path)
+                for p in (pix, os.path.join(base, pix), os.path.join(base, "pixmaps", pix)):
+                    if os.path.isfile(p):
+                        mode = {"tiled": "tile", "centered": "center",
+                                "aspect": "fit"}.get(kind, "fill")
+                        return ("image", p, mode)
+            c = self.color("background.color", default=None)
+            c2 = self.color("background.colorTo", default=None)
+            if c and c2 and "gradient" in kind:
+                return ("gradient", c, c2, kind)
+            if c:
+                return ("solid", c)
+        root = db.get("rootCommand") or ""
+        if root:
+            m = re.search(r"-solid\s+(\S+)", root)
+            if m:
+                return ("solid", parse_color(m.group(1), "#202020"))
+            m1 = re.search(r"-from\s+(\S+)", root)
+            m2 = re.search(r"-to\s+(\S+)", root)
+            if m1 and m2:
+                g = re.search(r"-gradient\s+(\S+)", root)
+                return ("gradient", parse_color(m1.group(1), "#202020"),
+                        parse_color(m2.group(1), "#404040"), g.group(1) if g else "vertical")
+            m = re.search(r"-bg\s+(\S+)", root)
+            if m:
+                return ("solid", parse_color(m.group(1), "#202020"))
+        return ("gradient", darken(self.toolbar.mid(), .25), darken(self.title_f.mid(), .55),
+                "diagonal")
+
+    def dark(self):
+        return luminance(self.menu_frame.mid()) < 0.25
+
+
+# --------------------------------------------------------------------------
+# Small PNG writer (wallpaper gradients) and SVG buttons
+# --------------------------------------------------------------------------
+
+def write_gradient_png(path, a, b, kind, w=480, h=300):
+    ra, rb = rgb(a), rgb(b)
+    rows = []
+    kind = kind.lower()
+    for y in range(h):
+        row = bytearray(b"\x00")
+        for x in range(w):
+            if "horizontal" in kind:
+                t = x / (w - 1)
+            elif "diagonal" in kind and "cross" in kind:
+                t = ((w - 1 - x) / (w - 1) + y / (h - 1)) / 2
+            elif "diagonal" in kind:
+                t = (x / (w - 1) + y / (h - 1)) / 2
+            elif any(k in kind for k in ("elliptic", "pipecross", "rectangle", "pyramid")):
+                dx, dy = (x / (w - 1) - .5) * 2, (y / (h - 1) - .5) * 2
+                t = min(1.0, (dx * dx + dy * dy) ** .5 / 1.414)
+            else:
+                t = y / (h - 1)
+            row += bytes(round(ra[i] + (rb[i] - ra[i]) * t) for i in range(3))
+        if "interlaced" in kind and y % 2:
+            row = bytearray([row[0]]) + bytearray(max(0, v - 12) for v in row[1:])
+        rows.append(bytes(row))
+    raw = b"".join(rows)
+
+    def chunk(t, d):
+        c = struct.pack(">I", len(d)) + t + d
+        return c + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+def read_xpm(path):
+    """Parse an XPM3 file -> (w, h, rows of RGBA tuples) or None."""
+    try:
+        text = open(path, encoding="latin-1").read()
+    except OSError:
+        return None
+    strs = re.findall(r'"((?:[^"\\]|\\.)*)"', re.sub(r"/\*.*?\*/", "", text, flags=re.S))
+    if not strs:
+        return None
+    try:
+        w, h, nc, cpp = (int(x) for x in strs[0].split()[:4])
+    except ValueError:
+        return None
+    colors = {}
+    for line in strs[1:1 + nc]:
+        key, rest = line[:cpp], line[cpp:].split()
+        val = None
+        for i in range(0, len(rest) - 1):
+            if rest[i] == "c":
+                val = " ".join(rest[i + 1:]).split(" s ")[0].strip()
+                break
+        if val is None and rest:
+            val = rest[-1]
+        if val is None or val.lower() == "none":
+            colors[key] = (0, 0, 0, 0)
+        else:
+            c = parse_color(val, "#000000")
+            colors[key] = rgb(c) + (255,)
+    rows = []
+    for line in strs[1 + nc:1 + nc + h]:
+        rows.append([colors.get(line[i:i + cpp], (0, 0, 0, 0)) for i in range(0, w * cpp, cpp)])
+    if len(rows) != h:
+        return None
+    return w, h, rows
+
+
+def write_rgba_png(path, w, h, rows):
+    raw = b"".join(b"\x00" + bytes(v for px in row for v in px) for row in rows)
+
+    def chunk(t, d):
+        c = struct.pack(">I", len(d)) + t + d
+        return c + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+# labwc button -> Fluxbox pixmap resources (focus, unfocus, pressed)
+BUTTON_PIXMAPS = {
+    "close": "close", "max": "maximize", "max_toggled": "maximize", "iconify": "iconify",
+    "shade": "shade", "shade_toggled": "unshade", "desk": "stick", "desk_toggled": "stuck",
+    "menu": "menuicon",
+}
+
+
+GLYPHS = {
+    "close": '<path d="M5.5 5.5l7 7M12.5 5.5l-7 7" stroke="{c}" stroke-width="2" stroke-linecap="square"/>',
+    "max": '<rect x="5" y="5" width="8" height="8" fill="none" stroke="{c}" stroke-width="1.5"/>'
+           '<rect x="5" y="5" width="8" height="2" fill="{c}"/>',
+    "max_toggled": '<rect x="7" y="4.5" width="6.5" height="6.5" fill="none" stroke="{c}" stroke-width="1.2"/>'
+                   '<rect x="4.5" y="7" width="6.5" height="6.5" fill="{bg}" stroke="{c}" stroke-width="1.2"/>',
+    "iconify": '<rect x="5" y="11" width="8" height="2.2" fill="{c}"/>',
+    "shade": '<rect x="5" y="5" width="8" height="2.2" fill="{c}"/>',
+    "shade_toggled": '<rect x="5" y="5" width="8" height="2.2" fill="{c}"/>'
+                     '<path d="M6 9h6l-3 4z" fill="{c}"/>',
+    "desk": '<rect x="7" y="7" width="4" height="4" fill="none" stroke="{c}" stroke-width="1.3"/>',
+    "desk_toggled": '<rect x="6" y="6" width="6" height="6" fill="{c}"/>',
+    "menu": '<path d="M5 6h8M5 9h8M5 12h8" stroke="{c}" stroke-width="1.5"/>',
+}
+
+
+def button_svg(tex, glyph_color, glyph, hover=False):
+    a, b = tex.color, tex.color_to if tex.gradient else tex.color
+    if hover:
+        a, b = lighten(a, .2), lighten(b, .2)
+    base = mix(a, b, .5)
+    hi, lo = lighten(base, .4), darken(base, .45)
+    if tex.relief == "sunken":
+        hi, lo = lo, hi
+    flat = tex.relief == "flat" or tex.parent
+    bevel = "" if flat else (
+        '<path d="M2.5 15.5V2.5h13" fill="none" stroke="%s"/>'
+        '<path d="M2.5 15.5h13V2.5" fill="none" stroke="%s"/>' % (hi, lo))
+    fill = "none" if tex.parent else "url(#g)"
+    return ('<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18">'
+            '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+            '<stop offset="0" stop-color="%s"/><stop offset="1" stop-color="%s"/>'
+            '</linearGradient></defs>'
+            '<rect x="2" y="2" width="14" height="14" fill="%s"/>%s%s</svg>\n'
+            % (a, b, fill, bevel, GLYPHS[glyph].format(c=glyph_color, bg=base)))
+
+
+# --------------------------------------------------------------------------
+# Renderers
+# --------------------------------------------------------------------------
+
+def render_theme(st, init):
+    tdir = os.path.join(XDG_DATA, "themes", GEN_THEME, "labwc")
+    os.makedirs(tdir, exist_ok=True)
+    title_f = st.label_f if st.title_f.parent else st.title_f
+    title_u = st.label_u if st.title_u.parent else st.title_u
+    lines = ["# Generated by kflux from Fluxbox style: %s" % st.path,
+             "# Do not edit; change the style or ~/.config/kflux/init and run `kflux apply`.",
+             "border.width: %d" % max(1, st.border_w),
+             "window.active.border.color: %s" % st.frame_f,
+             "window.inactive.border.color: %s" % st.frame_u,
+             "window.titlebar.padding.width: 1",
+             "window.titlebar.padding.height: 0",
+             "window.button.width: @BTN@", "window.button.height: @BTN@",
+             "window.button.spacing: 0",
+             "window.label.text.justify: %s" % st.justify]
+    lines += title_f.labwc("window.active.title.bg")
+    lines += title_u.labwc("window.inactive.title.bg")
+    lines += ["window.active.label.text.color: %s" % readable(st.text_f, title_f.mid()),
+              "window.inactive.label.text.color: %s" % readable(st.text_u, title_u.mid()),
+              "window.active.button.unpressed.image.color: %s" % st.pic_f,
+              "window.inactive.button.unpressed.image.color: %s" % st.pic_u,
+              "window.active.shadow.size: 0", "window.inactive.shadow.size: 0",
+              "menu.overlap.x: 0", "menu.overlap.y: 0",
+              "menu.width.min: 120", "menu.width.max: 320",
+              "menu.border.width: %d" % st.menu_border_w,
+              "menu.border.color: %s" % st.menu_border_c,
+              "menu.items.padding.x: 8", "menu.items.padding.y: 2",
+              "menu.items.bg.color: %s" % st.menu_frame.mid(),
+              "menu.items.text.color: %s" % readable(st.menu_text, st.menu_frame.mid()),
+              "menu.items.active.bg.color: %s" % st.menu_hilite.mid(),
+              "menu.items.active.text.color: %s" % readable(st.menu_hilite_text,
+                                                            st.menu_hilite.mid()),
+              "menu.separator.width: 1",
+              "menu.separator.padding.width: 4", "menu.separator.padding.height: 2",
+              "menu.separator.color: %s" % st.menu_disable,
+              "menu.title.bg.color: %s" % st.menu_title.mid(),
+              "menu.title.text.color: %s" % readable(st.menu_title_text, st.menu_title.mid()),
+              "menu.title.text.justify: Center",
+              "osd.bg.color: %s" % st.toolbar.mid(),
+              "osd.border.color: %s" % st.border_c,
+              "osd.border.width: %d" % max(1, st.border_w),
+              "osd.label.text.color: %s" % readable(st.toolbar.text, st.toolbar.mid()),
+              "osd.window-switcher.style-classic.width: 50%",
+              "osd.workspace-switcher.boxes.width: 18",
+              "osd.workspace-switcher.boxes.height: 14",
+              "snapping.overlay.region.bg.enabled: no",
+              "snapping.overlay.edge.bg.enabled: no",
+              "snapping.overlay.region.border.enabled: yes",
+              "snapping.overlay.edge.border.enabled: yes"]
+    # Buttons: the style's own XPM pixmaps where it has them (converted to PNG),
+    # otherwise Fluxbox-style square bevelled SVGs drawn from its textures.
+    for f in glob.glob(os.path.join(tdir, "*.svg")) + glob.glob(os.path.join(tdir, "*.png")):
+        os.remove(f)
+    base = os.path.dirname(style_file(st.path) or st.path)
+    pixdirs = [os.path.join(base, "pixmaps"), base]
+
+    def pixmap(res):
+        v = st.db.get(res)
+        if not v:
+            return None
+        for d in pixdirs:
+            p = os.path.join(d, expand(v))
+            if os.path.isfile(p):
+                return read_xpm(p)
+        return None
+    btn_size = [0]
+    for state, tex, pic in (("active", st.btn_f, st.pic_f), ("inactive", st.btn_u, st.pic_u)):
+        for g in GLYPHS:
+            fb = BUTTON_PIXMAPS[g]
+            img = pixmap("window.%s.%spixmap" % (fb, "" if state == "active" else "unfocus."))
+            if img is None and state == "inactive":
+                img = pixmap("window.%s.pixmap" % fb)
+            hov = pixmap("window.%s.pressed.pixmap" % fb) or img
+            if img is not None:
+                btn_size[0] = max(btn_size[0], img[0], img[1])
+                write_rgba_png(os.path.join(tdir, "%s-%s.png" % (g, state)), *img)
+                write_rgba_png(os.path.join(tdir, "%s_hover-%s.png" % (g, state)), *hov)
+                continue
+            write(os.path.join(tdir, "%s-%s.svg" % (g, state)), button_svg(tex, pic, g))
+            write(os.path.join(tdir, "%s_hover-%s.svg" % (g, state)),
+                  button_svg(tex, pic, g, hover=True))
+    size = btn_size[0] or 18
+    write(os.path.join(tdir, "themerc"), "\n".join(lines).replace("@BTN@", str(size)) + "\n")
+
+
+def font_css(f):
+    return "font-family: %s; font-size: %dpt; font-weight: %s;" % (
+        ", ".join('"%s"' % x.strip() if " " in x.strip() else x.strip()
+                  for x in f["family"].split(",")),
+        f["size"], "bold" if f["bold"] else "normal")
+
+
+def output_size():
+    try:
+        out = subprocess.run(["wlr-randr", "--json"], capture_output=True, text=True,
+                             timeout=3).stdout if os.environ.get("WAYLAND_DISPLAY") else "[]"
+        for o in json.loads(out):
+            if o.get("enabled"):
+                for m in o.get("modes", []):
+                    if m.get("current"):
+                        sc = o.get("scale", 1) or 1
+                        return int(m["width"] / sc), int(m["height"] / sc)
+    except Exception:
+        pass
+    return 1280, 800
+
+
+def toolbar_tools(init):
+    raw = init.get("session.screen0.toolbar.tools",
+                   "prevworkspace, workspacename, nextworkspace, iconbar, systemtray, clock")
+    return [t.strip().lower() for t in raw.split(",") if t.strip()]
+
+
+def strftime_to_waybar(fmt):
+    return "{:%s}" % fmt.replace("%k", "%H").replace("%l", "%I")
+
+
+# The toolbar maps first and claims its exclusive zone; the slit is placed in
+# what is left, so it sits above (or below) the toolbar as in Fluxbox.
+TOOLBAR_GEOM = {"pos": "bottom", "height": 0, "visible": True}
+
+
+def render_toolbar(st, init):
+    W, H = output_size()
+    tools = toolbar_tools(init)
+    placement = init.get("session.screen0.toolbar.placement", "BottomCenter").lower()
+    width_pct = int(init.get("session.screen0.toolbar.widthPercent", "100") or 100)
+    height = int(init.get("session.screen0.toolbar.height", "0") or 0)
+    if height <= 0:
+        height = max(18, int(st.tb_font["size"] * 1.333 + 2 * st.bevel + 6))
+    pos = "top" if placement.startswith("top") else "bottom"
+    width = W * min(100, max(10, width_pct)) // 100
+    spare = W - width
+    if placement.endswith("left"):
+        margins = (0, spare)
+    elif placement.endswith("right"):
+        margins = (spare, 0)
+    else:
+        margins = (spare // 2, spare - spare // 2)
+    left, center, right = [], [], []
+    seen_iconbar = False
+    mods = {}
+    for t in tools:
+        if t == "iconbar":
+            seen_iconbar = True
+            left.append("wlr/taskbar")
+            mods["wlr/taskbar"] = {
+                "format": "{icon} {title}", "icon-size": max(12, height - 8),
+                "tooltip-format": "{title}", "on-click": "activate",
+                "on-click-middle": "close", "on-click-right": "minimize-raise",
+                "all-outputs": False}
+            continue
+        target = right if seen_iconbar else left
+        if t == "workspacename":
+            target.append("ext/workspaces")
+            mods["ext/workspaces"] = {"format": "{name}", "active-only": True,
+                                      "on-click": "activate", "sort-by-id": True}
+        elif t in ("prevworkspace", "nextworkspace", "prevwindow", "nextwindow"):
+            name = "custom/" + t
+            target.append(name)
+            glyph = "◂" if t.startswith("prev") else "▸"
+            cmd = {"prevworkspace": "kflux ws prev", "nextworkspace": "kflux ws next",
+                   "prevwindow": "kflux win prev", "nextwindow": "kflux win next"}[t]
+            mods[name] = {"format": glyph, "tooltip": False, "on-click": cmd}
+        elif t == "systemtray":
+            target.append("tray")
+            mods["tray"] = {"icon-size": max(12, height - 8), "spacing": 3}
+        elif t == "clock":
+            target.append("clock")
+            fmt = init.get("session.screen0.strftimeFormat", "%k:%M")
+            mods["clock"] = {"format": strftime_to_waybar(fmt), "interval": 30,
+                             "tooltip-format": "<tt>{calendar}</tt>",
+                             "on-click": "kflux exec-kcm clock"}
+        elif t.startswith("button."):
+            bname = t.split(".", 1)[1]
+            label = init.get("session.screen0.toolbar.button.%s.label" % bname, bname)
+            cmd = init.get("session.screen0.toolbar.button.%s.commands" % bname, "")
+            cmd = cmd.split(":")[0] if cmd else ""
+            name = "custom/button-" + bname
+            target.append(name)
+            mods[name] = {"format": label, "tooltip": False,
+                          "on-click": translate_command(cmd) if cmd else ""}
+        else:
+            warn("toolbar tool %r not supported" % t)
+    TOOLBAR_GEOM.update(pos=pos, height=height + 2,
+                        visible=init.get("session.screen0.toolbar.visible", "true").lower() != "false")
+    cfg = {"name": "kflux-toolbar", "layer": "top" if init.get(
+        "session.screen0.toolbar.layer", "Dock").lower() in ("dock", "top", "abovedock") else "bottom",
+           "position": pos, "height": height, "exclusive": True, "spacing": 0,
+           "margin-left": margins[0], "margin-right": margins[1],
+           "modules-left": left, "modules-center": center, "modules-right": right,
+           "fixed-center": False, "reload_style_on_change": False}
+    cfg.update(mods)
+    if init.get("session.screen0.toolbar.visible", "true").lower() == "false":
+        cfg["start_hidden"] = True
+    wdir = os.path.join(XDG_CONFIG, "kflux", "generated")
+    write(os.path.join(wdir, "toolbar.json"), json.dumps(cfg, indent=2) + "\n")
+
+    tb = st.toolbar
+    bw = max(0, int(re.sub(r"\D", "", st.db.first("toolbar.borderWidth", "borderWidth",
+                                                  default="1")) or 1))
+    bc = st.color("toolbar.borderColor", "borderColor", default=st.border_c)
+    pad = max(1, st.bevel)
+    css = """/* Generated by kflux from Fluxbox style: %(path)s */
+* { %(font)s border-radius: 0; min-height: 0; box-shadow: none; text-shadow: none; }
+window#waybar { %(tb)s color: %(tbtext)s; border: %(bw)dpx solid %(bc)s; }
+window#waybar > box { padding: %(pad)dpx; }
+#workspaces button { %(ws)s color: %(wstext)s; padding: 0 12px; margin: 0; }
+#workspaces button:hover { box-shadow: none; text-shadow: none; }
+#custom-prevworkspace, #custom-nextworkspace, #custom-prevwindow, #custom-nextwindow {
+  %(btn)s color: %(pic)s; padding: 0 5px; margin: 0 %(pad)dpx; }
+#taskbar { %(empty)s margin: 0 %(pad)dpx; }
+#taskbar button { %(unf)s color: %(unftext)s; padding: 0 6px; margin: 0 1px; min-width: 150px; }
+#taskbar button.active { %(foc)s color: %(foctext)s; }
+#taskbar button label { %(font)s }
+#tray { padding: 0 6px; margin: 0 %(pad)dpx; }
+#clock { %(clock)s color: %(clocktext)s; padding: 0 10px; }
+%(buttons)s
+tooltip { background: %(menubg)s; color: %(menutext)s; border: 1px solid %(bc)s; }
+""" % {
+        "path": st.path, "font": font_css(st.tb_font), "tb": tb.css(),
+        "tbtext": tb.text, "bw": bw, "bc": bc, "pad": pad,
+        "ws": st.workspace.css(), "wstext": st.workspace.text,
+        "btn": st.tb_button.css(), "pic": st.tb_button.pic,
+        "empty": st.ib_empty.css(border=False),
+        "unf": st.ib_unfocused.css(), "unftext": st.ib_unfocused.text,
+        "foc": st.ib_focused.css(), "foctext": st.ib_focused.text,
+        "clock": st.clock.css(), "clocktext": st.clock.text,
+        "menubg": st.menu_frame.mid(), "menutext": st.menu_text,
+        "buttons": "\n".join("#%s { %s color: %s; padding: 0 6px; margin: 0 %dpx; }" % (
+            m.replace("/", "-"), st.tb_button.css(), st.tb_button.pic, pad)
+            for m in left + right if m.startswith("custom/button-"))}
+    write(os.path.join(wdir, "toolbar.css"), css)
+
+
+DOCKAPPS = {
+    "clock": ("clock", {"format": "<span size='x-large' weight='bold'>{0:%H:%M}</span>\n{0:%a %d}",
+                        "interval": 30, "tooltip-format": "<tt>{calendar}</tt>"}),
+    "cpu": ("cpu", {"format": "CPU\n<span size='large' weight='bold'>{usage}%</span>\n{icon}",
+                    "format-icons": ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"], "interval": 2,
+                    "on-click": "konsole -e htop"}),
+    "mem": ("memory", {"format": "MEM\n<span size='large' weight='bold'>{percentage}%</span>\n"
+                                 "{used:0.1f}G", "interval": 5}),
+    "net": ("network", {"format": "NET\n{bandwidthDownBytes}\n{bandwidthUpBytes}",
+                        "format-disconnected": "NET\n--\noff", "interval": 3,
+                        "on-click": "kflux exec-kcm network"}),
+    "volume": ("pulseaudio", {"format": "VOL\n<span size='large' weight='bold'>{volume}%</span>",
+                              "format-muted": "VOL\nmute", "on-click": "kflux exec-kcm audio",
+                              "on-scroll-up": "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+",
+                              "on-scroll-down": "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-"}),
+    "disk": ("disk", {"format": "DISK\n<span size='large' weight='bold'>{percentage_used}%</span>\n/",
+                      "interval": 60, "path": "/"}),
+}
+
+
+def read_slitlist():
+    p = os.path.join(KFLUX, "slitlist")
+    items = []
+    if os.path.isfile(p):
+        for line in open(p, encoding="utf-8"):
+            line = line.split("#", 1)[0].strip()
+            if line:
+                items.append(line)
+    return items
+
+
+def render_slit(st, init):
+    W, H = output_size()
+    items = read_slitlist()
+    placement = init.get("session.screen0.slit.placement", "RightCenter").lower()
+    mods, names = {}, []
+    for i, it in enumerate(items):
+        if it.lower() in DOCKAPPS:
+            mod, cfg = DOCKAPPS[it.lower()]
+            names.append(mod)
+            mods[mod] = cfg
+        elif it.lower().startswith("custom:"):
+            # custom: Label : command   (command prints the tile text, may use \n)
+            parts = [p.strip() for p in it.split(":", 2)]
+            label = parts[1] if len(parts) > 1 else "app"
+            cmd = parts[2] if len(parts) > 2 else "true"
+            name = "custom/dock%d" % i
+            names.append(name)
+            mods[name] = {"exec": cmd, "interval": 5, "format": label + "\n{}",
+                          "tooltip": False}
+        else:
+            warn("slitlist entry %r not known (try: %s, custom: Label : cmd)" % (
+                it, ", ".join(DOCKAPPS)))
+    tile = 64
+    vertical = not placement.startswith(("top", "bottom")) or "left" == placement or "right" == placement
+    if placement.startswith(("top", "bottom")) and not placement.endswith(("left", "right")):
+        vertical = False
+    n = max(1, len(names))
+    length = n * (tile + 2) + 6
+    if vertical:
+        pos = "left" if placement.startswith("left") else "right"
+        usable = H - (TOOLBAR_GEOM["height"] if TOOLBAR_GEOM["visible"] else 0)
+        spare = max(0, usable - length)
+        if placement.endswith("top"):
+            m = (0, spare)
+        elif placement.endswith("bottom"):
+            m = (spare, 0)
+        else:
+            m = (spare // 2, spare - spare // 2)
+        cfg = {"position": pos, "width": tile + 6, "margin-top": m[0], "margin-bottom": m[1]}
+    else:
+        pos = "top" if placement.startswith("top") else "bottom"
+        spare = max(0, W - length)
+        if placement.endswith("left"):
+            m = (0, spare)
+        elif placement.endswith("right"):
+            m = (spare, 0)
+        else:
+            m = (spare // 2, spare - spare // 2)
+        cfg = {"position": pos, "height": tile + 6, "margin-left": m[0], "margin-right": m[1]}
+    cfg.update({"name": "kflux-slit", "layer": "top", "exclusive": True, "spacing": 2,
+                "modules-left": names, "reload_style_on_change": False})
+    cfg.update(mods)
+    wdir = os.path.join(XDG_CONFIG, "kflux", "generated")
+    write(os.path.join(wdir, "slit.json"), json.dumps(cfg, indent=2) + "\n")
+    # Dockapp tiles: 64x64, bevelled, LCD-ish face in the style's colours.
+    face = darken(st.slit.mid(), .55) if luminance(st.slit.mid()) > .08 else lighten(st.slit.mid(), .06)
+    lcd = st.ib_focused.text if contrast(st.ib_focused.text, face) > 3 else (
+        "#9ad0ff" if luminance(face) < .3 else "#102030")
+    hi, lo = lighten(st.slit.mid(), .35), darken(st.slit.mid(), .5)
+    css = """/* Generated by kflux: slit with dockapp-style tiles */
+* { font-family: "Terminess Nerd Font", Terminus, monospace; font-size: 9pt;
+    border-radius: 0; min-height: 0; box-shadow: none; text-shadow: none; }
+window#waybar { %(slit)s border: 1px solid %(bc)s; }
+window#waybar > box { padding: 2px; }
+.modules-left > widget > * {
+  min-width: %(t)dpx; min-height: %(t)dpx; margin: 1px; padding: 0;
+  background: %(face)s; color: %(lcd)s;
+  border-style: solid; border-width: 2px; border-color: %(lo)s %(hi)s %(hi)s %(lo)s; }
+.modules-left > widget > * > label { padding: 0 2px; }
+""" % {"slit": st.slit.css(), "bc": st.border_c, "t": tile - 6, "face": face, "lcd": lcd,
+       "hi": hi, "lo": lo}
+    write(os.path.join(wdir, "slit.css"), css)
+
+
+def render_kde_colors(st):
+    """Write a KDE colour scheme and merge it into kdeglobals."""
+    win = st.menu_frame.mid()
+    fg = readable(st.menu_text, win)
+    view = lighten(win, .55) if not st.dark() else darken(win, .25)
+    vfg = readable(fg, view)
+    btn = st.ib_unfocused.mid() if not st.ib_unfocused.parent else st.toolbar.mid()
+    bfg = readable(st.ib_unfocused.text, btn)
+    sel = st.menu_hilite.mid()
+    sfg = readable(st.menu_hilite_text, sel)
+    tip = st.toolbar.mid()
+    tfg = readable(st.toolbar.text, tip)
+    hdr = st.title_f.mid()
+    hfg = readable(st.text_f, hdr)
+    link = sel if contrast(sel, view) > 2.5 else ("#2980b9" if not st.dark() else "#7fbfff")
+
+    def group(bg, fgc, alt=None):
+        return {
+            "BackgroundNormal": bg, "BackgroundAlternate": alt or mix(bg, fgc, .05),
+            "ForegroundNormal": fgc, "ForegroundInactive": mix(fgc, bg, .4),
+            "ForegroundActive": sel if contrast(sel, bg) > 2 else fgc,
+            "ForegroundLink": link, "ForegroundVisited": mix(link, "#8e44ad", .5),
+            "ForegroundNegative": "#da4453", "ForegroundNeutral": "#f67400",
+            "ForegroundPositive": "#27ae60", "DecorationFocus": sel, "DecorationHover": sel}
+    groups = {"Colors:Window": group(win, fg), "Colors:View": group(view, vfg),
+              "Colors:Button": group(btn, bfg), "Colors:Selection": group(sel, sfg),
+              "Colors:Tooltip": group(tip, tfg), "Colors:Complementary": group(tip, tfg),
+              "Colors:Header": group(hdr, hfg)}
+    groups["Colors:Header][Inactive"] = group(st.title_u.mid(), readable(st.text_u, st.title_u.mid()))
+    wm = {"activeBackground": hdr, "activeForeground": hfg,
+          "inactiveBackground": st.title_u.mid(),
+          "inactiveForeground": readable(st.text_u, st.title_u.mid()),
+          "activeBlend": hdr, "inactiveBlend": st.title_u.mid()}
+    scheme = "kflux-" + re.sub(r"[^A-Za-z0-9_-]", "_", st.name)
+
+    def ini_rgb(c):
+        return ",".join(str(v) for v in rgb(c))
+    text = ["[General]", "ColorScheme=%s" % scheme, "Name=kflux %s" % st.name, ""]
+    for g, vals in groups.items():
+        text.append("[%s]" % g)
+        text += ["%s=%s" % (k, ini_rgb(v)) for k, v in vals.items()]
+        text.append("")
+    text.append("[WM]")
+    text += ["%s=%s" % (k, ini_rgb(v)) for k, v in wm.items()]
+    write(os.path.join(XDG_DATA, "color-schemes", scheme + ".colors"), "\n".join(text) + "\n")
+
+    # Merge into kdeglobals: replace colour groups, keep everything else.
+    kg = os.path.join(XDG_CONFIG, "kdeglobals")
+    sections, order, cur = {}, [], None
+    if os.path.isfile(kg):
+        for line in open(kg, encoding="utf-8", errors="replace"):
+            line = line.rstrip("\n")
+            m = re.match(r"^\[(.+)\]$", line)
+            if m:
+                cur = m.group(1)
+                if cur not in sections:
+                    sections[cur] = []
+                    order.append(cur)
+            elif cur is not None and line.strip():
+                sections[cur].append(line)
+    for g in list(groups) + ["WM"]:
+        sections[g] = ["%s=%s" % (k, ini_rgb(v)) for k, v in (groups.get(g) or wm).items()]
+        if g not in order:
+            order.append(g)
+    gen = [l for l in sections.get("General", []) if not l.startswith(("ColorScheme=",))]
+    sections["General"] = ["ColorScheme=%s" % scheme] + gen
+    if "General" not in order:
+        order.insert(0, "General")
+    ic = [l for l in sections.get("Icons", []) if not l.startswith("Theme=")]
+    sections["Icons"] = ["Theme=%s" % ("breeze-dark" if st.dark() else "breeze")] + ic
+    if "Icons" not in order:
+        order.append("Icons")
+    kde = [l for l in sections.get("KDE", []) if not l.startswith("widgetStyle=")]
+    sections["KDE"] = ["widgetStyle=Breeze"] + kde
+    if "KDE" not in order:
+        order.append("KDE")
+    write(kg, "\n".join("[%s]\n%s\n" % (s, "\n".join(sections[s])) for s in order))
+
+
+def render_misc(st):
+    # mako notifications
+    f = st.menu_font
+    write(os.path.join(XDG_CONFIG, "mako", "config"), """# Generated by kflux
+font=%s %d
+background-color=%s
+text-color=%s
+border-color=%s
+border-size=%d
+border-radius=0
+padding=6
+margin=8
+width=320
+default-timeout=6000
+anchor=top-right
+""" % (f["family"].split(",")[0], f["size"] + 1, st.menu_frame.mid(),
+       readable(st.menu_text, st.menu_frame.mid()), st.menu_border_c, max(1, st.menu_border_w)))
+    bg = st.background
+    color = bg[1] if bg[0] == "solid" else (mix(bg[1], bg[2], .5) if bg[0] == "gradient"
+                                            else st.toolbar.mid())
+    write(os.path.join(XDG_CONFIG, "swaylock", "config"), """# Generated by kflux
+color=%s
+inside-color=%s
+ring-color=%s
+key-hl-color=%s
+text-color=%s
+indicator-radius=60
+show-failed-attempts
+""" % (color.lstrip("#"), st.toolbar.mid().lstrip("#"), st.title_f.mid().lstrip("#"),
+       st.menu_hilite.mid().lstrip("#"), readable(st.toolbar.text, st.toolbar.mid()).lstrip("#")))
+    # wallpaper
+    cache = os.path.join(XDG_CACHE, "kflux")
+    override = expand(read_init().get("kflux.wallpaper", ""))
+    if override and os.path.isfile(override):
+        spec = ["-i", override, "-m", "fill"]
+    elif bg[0] == "image":
+        spec = ["-i", bg[1], "-m", bg[2]]
+    elif bg[0] == "gradient":
+        p = os.path.join(cache, "wallpaper.png")
+        write_gradient_png(p, bg[1], bg[2], bg[3])
+        spec = ["-i", p, "-m", "stretch"]
+    else:
+        spec = ["-c", bg[1]]
+    write(os.path.join(cache, "wallpaper.args"), json.dumps(spec) + "\n")
+
+
+def ini_merge(path, updates):
+    """Merge {section: {key: value}} into a KDE-style ini file, keeping the rest."""
+    sections, order, cur = {}, [], None
+    if os.path.isfile(path):
+        for line in open(path, encoding="utf-8", errors="replace"):
+            line = line.rstrip("\n")
+            m = re.match(r"^\[(.+)\]$", line)
+            if m:
+                cur = m.group(1)
+                if cur not in sections:
+                    sections[cur] = {}
+                    order.append(cur)
+            elif cur is not None and "=" in line:
+                k, v = line.split("=", 1)
+                sections[cur][k] = v
+    for sec, kv in updates.items():
+        if sec not in sections:
+            sections[sec] = {}
+            order.append(sec)
+        sections[sec].update(kv)
+    write(path, "\n".join("[%s]\n%s\n" % (s_, "\n".join("%s=%s" % i for i in sections[s_].items()))
+                          for s_ in order))
+
+
+def render_konsole(st):
+    """A translucent Terminus profile coloured from the style, as on 2006 desktops."""
+    base = st.menu_frame.mid() if st.dark() else st.toolbar.mid()
+    bg = darken(base, .55) if luminance(base) > .02 else lighten(base, .03)
+    fg = "#d8dee6" if luminance(bg) < .3 else "#202020"
+    accent = st.menu_hilite.mid()
+    ansi = ["#1c1f24", "#cc6666", "#8fbf6f", "#d8b56a", accent if luminance(accent) > .05 else "#6f9fd8",
+            "#b294bb", "#70c0c0", "#c5c8c6"]
+    ansi_i = [lighten(c, .25) for c in ansi]
+    ansi[0], ansi_i[0] = darken(bg, .2), lighten(bg, .35)
+
+    def c(x):
+        return ",".join(str(v) for v in rgb(x))
+    lines = ["[General]", "Description=kflux (%s)" % st.name, "Opacity=0.92", "Blur=false", "",
+             "[Background]", "Color=" + c(bg), "", "[BackgroundIntense]", "Color=" + c(lighten(bg, .08)),
+             "", "[Foreground]", "Color=" + c(fg), "", "[ForegroundIntense]",
+             "Color=" + c(lighten(fg, .3)), ""]
+    for i in range(8):
+        lines += ["[Color%d]" % i, "Color=" + c(ansi[i]), "", "[Color%dIntense]" % i,
+                  "Color=" + c(ansi_i[i]), ""]
+    kdir = os.path.join(XDG_DATA, "konsole")
+    write(os.path.join(kdir, "kflux.colorscheme"), "\n".join(lines) + "\n")
+    font = read_init().get("kflux.terminalFont", "Terminess Nerd Font,10")
+    fam, _, size = font.partition(",")
+    write(os.path.join(kdir, "kflux.profile"), """[Appearance]
+ColorScheme=kflux
+Font=%s,%s,-1,5,400,0,0,0,0,0,0,0,0,0,0,1
+
+[General]
+Name=kflux
+Parent=FALLBACK/
+TerminalColumns=96
+TerminalRows=28
+
+[Scrolling]
+HistorySize=5000
+""" % (fam, size or "10"))
+    ini_merge(os.path.join(XDG_CONFIG, "konsolerc"), {"Desktop Entry": {"DefaultProfile": "kflux.profile"},
+                                                      "MainWindow": {"MenuBar": "Disabled",
+                                                                     "ToolBarsMovable": "Disabled"}})
+
+
+def render_conky(st, init):
+    """torsmo/conky stats in a desktop corner, the other half of the 2005 recipe."""
+    align = init.get("kflux.conky.alignment", "bottom_left")
+    fg = readable(st.toolbar.text, st.background[1] if st.background[0] == "solid" else
+                  mix(st.background[1], st.background[2], .5) if st.background[0] == "gradient"
+                  else "#202020")
+    hi = st.workspace.text if contrast(st.workspace.text, "#101010") > 3 else st.menu_hilite.mid()
+    # conky 1.25's Wayland backend aborts (display-wayland.cc set_font assertion),
+    # so it runs on Xwayland as an undecorated, always-below, translucent window.
+    conf = """-- Generated by kflux from style %(name)s. Set kflux.conky: false in init to disable.
+conky.config = {
+    output_backend = 'x11', use_xft = true, font = 'Terminess Nerd Font Mono:size=9',
+    alignment = '%(align)s', gap_x = 16, gap_y = 40,
+    minimum_width = 240, maximum_width = 240,
+    update_interval = 2, double_buffer = true,
+    own_window = true, own_window_class = 'kflux-conky', own_window_type = 'normal',
+    own_window_color = '%(panel)s',
+    own_window_hints = 'undecorated,below,sticky,skip_taskbar,skip_pager',
+    default_color = '%(fg)s', color1 = '%(hi)s',
+    draw_shades = false, draw_outline = false, draw_borders = false,
+    default_bar_width = 120, default_bar_height = 5,
+}
+conky.text = [[
+${color1}${nodename}${color} ${alignr}${kernel}
+${color1}up${color} ${uptime_short} ${alignr}${time %%a %%d %%b %%H:%%M}
+${color1}cpu${color} ${cpu}%% ${alignr}${cpubar}
+${color1}mem${color} ${memperc}%% ${alignr}${membar}
+${color1}disk${color} ${fs_used_perc /}%% ${alignr}${fs_bar /}
+${color1}load${color} ${loadavg} ${alignr}${processes} procs
+${color1}top${color} ${top name 1} ${alignr}${top cpu 1}%%
+]]
+""" % {"name": st.name, "align": align, "fg": fg, "hi": hi,
+       # conky 1.25 on Xwayland only clears its window with a non-zero alpha
+       "panel": "#d0" + darken(st.toolbar.mid(), .6).lstrip("#")}
+    write(os.path.join(KFLUX, "generated", "conky.conf"), conf)
+
+
+def start_conky(restart=False):
+    # conky sizes itself from the X work area: start it only once the panels
+    # are mapped (start_panels waits for them), and after the old one is gone.
+    import time
+    if restart:
+        stop("conky")
+        for _ in range(20):
+            if subprocess.run(["pgrep", "-x", "conky"], stdout=subprocess.DEVNULL).returncode:
+                break
+            time.sleep(0.1)
+    time.sleep(1.0)
+    if read_init().get("kflux.conky", "true").lower() == "false":
+        return
+    os.environ.setdefault("DISPLAY", ":0")  # labwc starts Xwayland on demand
+    spawn("conky", ["conky", "-c", os.path.join(KFLUX, "generated", "conky.conf")])
+
+
+# ---- tabs ------------------------------------------------------------------
+
+_LABWC_TABS = None
+
+
+def labwc_has_tabs():
+    """True if the installed labwc has kflux's tabs patch (labwc-kflux).
+
+    Stock labwc nags about unknown actions, so tab actions are only emitted
+    when the binary knows them. KFLUX_LABWC_TABS=0/1 overrides the check."""
+    global _LABWC_TABS
+    if _LABWC_TABS is None:
+        env = os.environ.get("KFLUX_LABWC_TABS")
+        if env in ("0", "1"):
+            _LABWC_TABS = env == "1"
+        else:
+            exe = shutil.which("labwc")
+            try:
+                with open(exe, "rb") as f:
+                    _LABWC_TABS = b"GroupWithWindowBelow\0" in f.read()
+            except (OSError, TypeError):
+                _LABWC_TABS = False
+    return _LABWC_TABS
+
+
+TAB_ACTIONS = ("ActivateTab", "StartTabbing", "NextTab", "PreviousTab", "DetachTab",
+               "MoveTabLeft", "MoveTabRight", "GroupWithWindowBelow", "GoToTab",
+               "JoinTabGroup")
+
+
+def drop_tab_actions(actions, what):
+    """Without labwc-kflux, leave tab actions out (with a warning)."""
+    if labwc_has_tabs() or not any(n in TAB_ACTIONS for n, _ in actions):
+        return actions
+    warn("tabs need labwc-kflux; installed labwc has none (%s)" % what)
+    return [a for a in actions if a[0] not in TAB_ACTIONS]
+
+
+# ---- keys ------------------------------------------------------------------
+
+MODS = {"mod1": "A", "alt": "A", "mod4": "W", "super": "W", "control": "C", "ctrl": "C",
+        "shift": "S", "mod5": "M", "mod3": "H", "mod2": None, "none": None}
+MOUSE_CTX = {"ondesktop": "Root", "onwindow": "Frame", "ontitlebar": "Title",
+             "ontoolbar": None, "onslit": None, "ontab": "Title",
+             "onwindowborder": "Border", "onleftgrip": "BLCorner", "onrightgrip": "BRCorner"}
+BUTTONS = {"1": "Left", "2": "Middle", "3": "Right", "4": "Up", "5": "Down",
+           "6": "Left", "7": "Right"}
+
+
+def translate_command(cmd):
+    cmd = cmd.strip()
+    first = cmd.split()[0] if cmd else ""
+    init = read_init()
+    subs = {"fbrun": init.get("kflux.runner", "krunner"),
+            "xterm": init.get("kflux.terminal", "konsole"),
+            "urxvt": init.get("kflux.terminal", "konsole"),
+            "aterm": init.get("kflux.terminal", "konsole"),
+            "x-terminal-emulator": init.get("kflux.terminal", "konsole"),
+            "fluxbox-remote": "kflux remote"}
+    if first in subs:
+        cmd = subs[first] + cmd[len(first):]
+    return cmd
+
+
+def split_macro(arg):
+    return re.findall(r"\{([^{}]*)\}", arg)
+
+
+def fb_action(text):
+    """One Fluxbox command -> list of (labwc action name, attrs dict)."""
+    text = text.strip()
+    m = re.match(r"(\w+)\s*(.*)$", text, re.S)
+    if not m:
+        return []
+    cmd, arg = m.group(1).lower(), m.group(2).strip()
+    # Strip Fluxbox window patterns/options like {groups} (workspace=[current]).
+    plain = re.sub(r"\{[^}]*\}|\([^)]*\)", "", arg).strip()
+    A = []
+    if cmd in ("macrocmd",):
+        for part in split_macro(arg):
+            A += fb_action(part)
+        return A
+    if cmd == "togglecmd":
+        parts = split_macro(arg)
+        warn("ToggleCmd not supported by labwc; using its first command (%s)" % (
+            parts[0] if parts else "?"))
+        return fb_action(parts[0]) if parts else []
+    if cmd in ("exec", "execcommand", "execute"):
+        return [("Execute", {"command": translate_command(arg)})]
+    simple = {
+        "close": "Close", "kill": "Kill", "killwindow": "Kill", "minimize": "Iconify",
+        "minimizewindow": "Iconify", "iconify": "Iconify", "maximize": "ToggleMaximize",
+        "maximizewindow": "ToggleMaximize", "fullscreen": "ToggleFullscreen",
+        "shade": "ToggleShade", "shadewindow": "ToggleShade", "shadeon": "Shade",
+        "shadeoff": "Unshade", "stick": "ToggleOmnipresent", "stickwindow": "ToggleOmnipresent",
+        "raise": "Raise", "lower": "Lower", "focus": "Focus", "raiselayer": "ToggleAlwaysOnTop",
+        "lowerlayer": "ToggleAlwaysOnBottom", "toggledecor": "ToggleDecorations",
+        "showdesktop": "ToggleShowDesktop", "exit": "Exit", "quit": "Exit",
+        "startmoving": "Move", "startresizing": "Resize", "deiconify": None,
+        "hidemenus": None,
+        # Tabs: labwc-kflux (decisions/0004). GroupWithWindowBelow is a kflux addition.
+        "activatetab": "ActivateTab", "starttabbing": "StartTabbing",
+        "nexttab": "NextTab", "prevtab": "PreviousTab", "detachclient": "DetachTab",
+        "movetableft": "MoveTabLeft", "movetabright": "MoveTabRight",
+        "groupwithwindowbelow": "GroupWithWindowBelow",
+    }
+    if cmd in simple:
+        name = simple[cmd]
+        if name is None:
+            return []
+        if cmd == "startresizing":
+            return [("Resize", {})]
+        return [(name, {})]
+    if cmd == "maximizehorizontal":
+        return [("ToggleMaximize", {"direction": "horizontal"})]
+    if cmd == "maximizevertical":
+        return [("ToggleMaximize", {"direction": "vertical"})]
+    if cmd in ("nextwindow", "nextgroup"):
+        return [("NextWindow", {})]
+    if cmd in ("prevwindow", "prevgroup"):
+        return [("PreviousWindow", {})]
+    if cmd in ("nextworkspace", "rightworkspace"):
+        return [("GoToDesktop", {"to": "right", "wrap": "yes"})]
+    if cmd in ("prevworkspace", "leftworkspace"):
+        return [("GoToDesktop", {"to": "left", "wrap": "yes"})]
+    if cmd == "workspace":
+        return [("GoToDesktop", {"to": plain or "1"})]
+    if cmd == "sendtoworkspace":
+        return [("SendToDesktop", {"to": plain or "1", "follow": "no"})]
+    if cmd == "taketoworkspace":
+        return [("SendToDesktop", {"to": plain or "1", "follow": "yes"})]
+    if cmd == "sendtonextworkspace":
+        return [("SendToDesktop", {"to": "right", "follow": "no"})]
+    if cmd == "sendtoprevworkspace":
+        return [("SendToDesktop", {"to": "left", "follow": "no"})]
+    if cmd == "taketonextworkspace":
+        return [("SendToDesktop", {"to": "right", "follow": "yes"})]
+    if cmd == "taketoprevworkspace":
+        return [("SendToDesktop", {"to": "left", "follow": "yes"})]
+    if cmd == "rootmenu":
+        return [("ShowMenu", {"menu": "root-menu"})]
+    if cmd == "windowmenu":
+        return [("ShowMenu", {"menu": "client-menu"})]
+    if cmd in ("workspacemenu", "clientmenu"):
+        return [("ShowMenu", {"menu": "client-list-combined-menu"})]
+    if cmd in ("reconfigure", "reconfig"):
+        return [("Execute", {"command": "kflux reconfigure"})]
+    if cmd == "restart":
+        return [("Execute", {"command": "kflux reconfigure --restart-panels"})]
+    if cmd == "setstyle":
+        return [("Execute", {"command": "kflux style %s" % shlex.quote(arg)})]
+    if cmd == "setlayer":
+        lay = plain.lower()
+        if lay in ("menu", "abovedock", "dock", "top", "0", "2", "4", "6"):
+            return [("ToggleAlwaysOnTop", {})]
+        if lay in ("bottom", "desktop", "10", "12"):
+            return [("ToggleAlwaysOnBottom", {})]
+        return []
+    if cmd in ("moveto",):
+        xy = plain.split()
+        if len(xy) >= 2:
+            return [("MoveTo", {"x": xy[0], "y": xy[1]})]
+    if cmd in ("resizeto",):
+        wh = plain.split()
+        if len(wh) >= 2:
+            return [("ResizeTo", {"width": wh[0], "height": wh[1]})]
+    if cmd in ("moveleft", "moveright", "moveup", "movedown"):
+        n = plain or "10"
+        dx = {"moveleft": "-" + n, "moveright": n}.get(cmd, "0")
+        dy = {"moveup": "-" + n, "movedown": n}.get(cmd, "0")
+        return [("MoveRelative", {"x": dx, "y": dy})]
+    if cmd == "arrangewindows":
+        warn("ArrangeWindows has no labwc equivalent; using AutoPlace")
+        return [("AutoPlace", {})]
+    if cmd == "tab":
+        if re.fullmatch(r"-?\d+", plain):
+            return [("GoToTab", {"index": plain})]
+        warn("Tab needs a number (%s)" % text)
+        return []
+    if cmd in ("setalpha",):
+        warn("SetAlpha not supported by labwc")
+        return []
+    if cmd in ("keymode", "bindkey", "if", "cond", "foreach", "map"):
+        warn("Fluxbox %s not translated" % cmd)
+        return []
+    warn("unknown Fluxbox command %r" % cmd)
+    return []
+
+
+def actions_xml(actions, indent="      "):
+    out = []
+    for name, attrs in actions:
+        a = "".join(' %s="%s"' % (k, esc(v)) for k, v in attrs.items())
+        out.append('%s<action name="%s"%s />' % (indent, name, a))
+    return "\n".join(out)
+
+
+def parse_keys(path):
+    """-> (keybinds [(key, actions)], mousebinds {ctx: [(button, event, actions)]})."""
+    keybinds, mouse = [], {}
+    if not os.path.isfile(path):
+        return keybinds, mouse
+    for raw in open(path, encoding="utf-8", errors="replace"):
+        line = raw.strip()
+        if not line or line[0] in "#!":
+            continue
+        if ":" not in line:
+            continue
+        lhs, rhs = line.split(":", 1)
+        toks = lhs.split()
+        if toks and toks[0].endswith(":"):  # keymode prefix "mymode:"
+            warn("keymodes not supported (%s)" % line)
+            continue
+        ctx, mods, button, event, key = None, [], None, "Click", None
+        chain = False
+        for i, t in enumerate(toks):
+            tl = t.lower()
+            if tl in MOUSE_CTX:
+                ctx = tl
+            elif tl in MODS:
+                if MODS[tl]:
+                    mods.append(MODS[tl])
+            elif tl == "double":
+                event = "DoubleClick"
+            elif re.fullmatch(r"(mouse|click|move)(\d+)", tl):
+                kind, n = re.fullmatch(r"(mouse|click|move)(\d+)", tl).groups()
+                if button is not None:
+                    chain = True
+                button = n
+                if event != "DoubleClick":
+                    event = {"mouse": "Press", "click": "Click", "move": "Drag"}[kind]
+            else:
+                if key is not None or button is not None:
+                    chain = True
+                key = t
+        if chain:
+            warn("chained bindings not supported: %s" % line.strip())
+            continue
+        acts = drop_tab_actions(fb_action(rhs), line.strip())
+        if button is not None:
+            labctx = MOUSE_CTX.get(ctx or "ondesktop")
+            if ctx is None:
+                labctx = "Root"
+            if labctx is None:
+                continue  # toolbar/slit bindings are handled by the panels
+            b = BUTTONS.get(button, "Left")
+            prefix = "-".join(mods)
+            bname = (prefix + "-" if prefix else "") + b
+            if b in ("Up", "Down"):
+                ev = "Scroll"
+            else:
+                ev = event
+                if ev == "Press" and any(n in ("Move", "Resize", "StartTabbing")
+                                         for n, _ in acts):
+                    ev = "Drag"
+                if ev == "Click" and ctx == "ondesktop":
+                    ev = "Press"
+            if ctx == "onwindow" and not mods:
+                warn("unmodified OnWindow binding skipped (would eat clicks): %s" % line)
+                continue
+            mouse.setdefault(labctx, []).append((bname, ev, acts))
+        elif key is not None:
+            if re.fullmatch(r"\d{2,3}", key):
+                warn("raw keycode %s not supported; use a keysym name" % key)
+                continue
+            prefix = "-".join(mods)
+            keybinds.append(((prefix + "-" if prefix else "") + key, acts))
+    return keybinds, mouse
+
+
+# ---- apps ------------------------------------------------------------------
+
+def parse_apps(path):
+    rules, startup = [], []
+    if not os.path.isfile(path):
+        return rules, startup
+    cur = None
+    group = None  # [group] ... [end]: the member apps' match dicts
+    for raw in open(path, encoding="utf-8", errors="replace"):
+        line = raw.strip()
+        if not line or line[0] in "#!":
+            continue
+        m = re.match(r"\[(\w+)\]\s*(.*)$", line)
+        if not m:
+            continue
+        tag, rest = m.group(1).lower(), m.group(2)
+        if tag == "startup":
+            cmd = re.search(r"\{(.*)\}", rest)
+            if cmd:
+                startup.append(cmd.group(1))
+            continue
+        if tag == "app":
+            match = {}
+            for k, v in re.findall(r"\((\w+)=([^)]*)\)", rest):
+                match[k.lower()] = v
+            plain = re.findall(r"\(([^=)]*)\)", rest)
+            if plain and not match:
+                match["name"] = plain[0]
+            if group is not None:
+                group.append(match)
+            else:
+                cur = {"match": match, "actions": [], "props": {}}
+            continue
+        if tag == "group":
+            # Fluxbox: windows of the listed apps open as tabs of one window.
+            # The settings in the block apply to every member app.
+            group = []
+            cur = {"match": {}, "actions": [], "props": {}}
+            continue
+        if tag == "end":
+            if group is not None:
+                idents = [m.get("class") or m.get("name") or m.get("role") for m in group]
+                idents = [i for i in idents if i]
+                for m in group:
+                    own = m.get("class") or m.get("name") or m.get("role")
+                    order = ([own] if own else []) + [i for i in idents if i != own]
+                    joins = drop_tab_actions(
+                        [("JoinTabGroup", {"identifier": i}) for i in order], "apps [group]")
+                    rules.append({"match": m, "actions": cur["actions"] + joins,
+                                  "props": dict(cur["props"])})
+                group = None
+            elif cur is not None:
+                rules.append(cur)
+            cur = None
+            continue
+        if tag == "transient":
+            warn("apps [transient] not supported")
+            continue
+        if cur is None:
+            continue
+        val = re.search(r"\{(.*?)\}", rest)
+        val = val.group(1).strip() if val else ""
+        anchor = re.search(r"\((\w+)\)", rest)
+        vl = val.lower()
+        A, P = cur["actions"], cur["props"]
+        if tag == "workspace" and val.isdigit():
+            A.append(("SendToDesktop", {"to": str(int(val) + 1), "follow": "no"}))
+        elif tag == "dimensions":
+            wh = val.split()
+            if len(wh) == 2:
+                A.append(("ResizeTo", {"width": wh[0].rstrip("%") + ("%" if "%" in wh[0] else ""),
+                                       "height": wh[1]}))
+        elif tag == "position":
+            xy = val.split()
+            if len(xy) == 2:
+                a = (anchor.group(1).lower() if anchor else "upperleft")
+                x, y = xy
+                if "right" in a:
+                    x = "-" + x.lstrip("-")
+                if "lower" in a or "bottom" in a:
+                    y = "-" + y.lstrip("-")
+                if a == "center":
+                    x, y = "center", "center"
+                A.append(("MoveTo", {"x": x, "y": y}))
+        elif tag == "layer":
+            # Fluxbox layers: Menu 0, AboveDock 2, Dock 4, Top 6, Normal 8,
+            # Bottom 10, Desktop 12.
+            if vl in ("0", "2", "4", "6", "menu", "abovedock", "dock", "top"):
+                A.append(("ToggleAlwaysOnTop", {}))
+            elif vl in ("10", "12", "bottom", "desktop"):
+                A.append(("ToggleAlwaysOnBottom", {}))
+        elif tag == "sticky" and vl == "yes":
+            A.append(("ToggleOmnipresent", {}))
+        elif tag == "shaded" and vl == "yes":
+            A.append(("Shade", {}))
+        elif tag == "maximized":
+            if vl in ("yes", "true"):
+                A.append(("Maximize", {}))
+            elif vl == "horz":
+                A.append(("Maximize", {"direction": "horizontal"}))
+            elif vl == "vert":
+                A.append(("Maximize", {"direction": "vertical"}))
+        elif tag == "minimized" and vl == "yes":
+            A.append(("Iconify", {}))
+        elif tag == "fullscreen" and vl == "yes":
+            A.append(("ToggleFullscreen", {}))
+        elif tag == "deco":
+            if vl in ("none", "0", "tool", "tiny"):
+                P["serverDecoration"] = "no"
+                A.append(("SetDecorations", {"decorations": "none"}))
+            elif vl in ("border",):
+                A.append(("SetDecorations", {"decorations": "border"}))
+        elif tag == "iconhidden" and vl == "yes":
+            P["skipTaskbar"] = "yes"
+        elif tag == "focushidden" and vl == "yes":
+            P["skipWindowSwitcher"] = "yes"
+        elif tag in ("alpha", "head", "tab", "close", "jump", "focusnewwindow",
+                     "ignoresizehints"):
+            warn("apps [%s] not supported" % tag)
+    return rules, startup
+
+
+BUILTIN_RULES = """    <windowRule identifier="kflux-conky" serverDecoration="no" skipTaskbar="yes"
+                skipWindowSwitcher="yes" ignoreFocusRequest="yes">
+      <action name="ToggleAlwaysOnBottom" />
+      <action name="ToggleOmnipresent" />
+    </windowRule>"""
+
+
+def apps_xml(rules):
+    out = [BUILTIN_RULES]
+    for r in rules:
+        attrs = {}
+        mt = r["match"]
+        ident = mt.get("class") or mt.get("name") or mt.get("role")
+        if ident:
+            attrs["identifier"] = ident
+        if mt.get("title"):
+            attrs["title"] = mt["title"]
+        if not attrs:
+            continue
+        attrs.update(r["props"])
+        a = "".join(' %s="%s"' % (k, esc(v)) for k, v in attrs.items())
+        if r["actions"]:
+            out.append('    <windowRule%s>\n%s\n    </windowRule>' % (
+                a, actions_xml(r["actions"], "      ")))
+        else:
+            out.append('    <windowRule%s />' % a)
+    return "\n".join(out)
+
+
+# ---- menus -----------------------------------------------------------------
+
+MENU_LINE = re.compile(r"^\s*\[(\w+)\]\s*(?:\(((?:[^)\\]|\\.)*)\))?\s*(?:\{(.*?)\})?\s*(?:<(.*?)>)?\s*$")
+
+
+def icon_attr(icon):
+    return ' icon="%s"' % esc(expand(icon)) if icon else ""
+
+
+class MenuBuilder:
+    def __init__(self):
+        self.menus = []  # extra top-level <menu> blocks
+        self.counter = 0
+        self.config_label = "Configure"
+
+    def nid(self, base):
+        self.counter += 1
+        return "%s-%d" % (base, self.counter)
+
+    def build(self, path, menu_id="root-menu"):
+        lines = []
+        self._read(path, lines, set())
+        items, _ = self._parse(lines, 0)
+        return '  <menu id="%s" label="">\n%s\n  </menu>' % (menu_id, "\n".join(items))
+
+    def _read(self, path, out, seen):
+        path = expand(path)
+        if not os.path.isfile(path) or path in seen:
+            return
+        seen.add(path)
+        for raw in open(path, encoding="utf-8", errors="replace"):
+            s = raw.strip()
+            if not s or s[0] == "#":
+                continue
+            m = MENU_LINE.match(s)
+            if m and m.group(1).lower() == "include":
+                inc = m.group(2) or m.group(3) or ""
+                inc = expand(inc)
+                if os.path.isdir(inc):
+                    for f in sorted(os.listdir(inc)):
+                        self._read(os.path.join(inc, f), out, seen)
+                else:
+                    if not os.path.isabs(inc):
+                        inc = os.path.join(os.path.dirname(path), inc)
+                    self._read(inc, out, seen)
+                continue
+            out.append(s)
+
+    def _parse(self, lines, i, ind="    "):
+        items = []
+        while i < len(lines):
+            m = MENU_LINE.match(lines[i])
+            i += 1
+            if not m:
+                warn("menu: cannot parse %r" % lines[i - 1])
+                continue
+            tag = m.group(1).lower()
+            label = (m.group(2) or "").replace("\\)", ")").replace("\\(", "(")
+            cmd = m.group(3)
+            icon = m.group(4)
+            if tag == "begin":
+                if label:
+                    items.append('%s<separator label="%s" />' % (ind, mlabel(label)))
+            elif tag == "end":
+                return items, i
+            elif tag == "exec":
+                items.append('%s<item label="%s"%s>\n%s\n%s</item>' % (
+                    ind, mlabel(label), icon_attr(icon),
+                    actions_xml([("Execute", {"command": translate_command(cmd or "")})],
+                                ind + "  "), ind))
+            elif tag == "submenu":
+                sub, i = self._parse(lines, i, ind + "  ")
+                if len(sub) == 1 and ' execute="' in sub[0]:
+                    # Fluxbox inlines [stylesdir]/[wallpapers] into the submenu
+                    items.append(ind + re.sub(r' label="[^"]*"', ' label="%s"' % mlabel(label),
+                                              sub[0].strip(), count=1))
+                    continue
+                items.append('%s<menu id="%s" label="%s"%s>\n%s\n%s</menu>' % (
+                    ind, self.nid("sub"), mlabel(label), icon_attr(icon), "\n".join(sub), ind))
+            elif tag == "pipe":  # kflux extension: openbox pipe menu
+                items.append('%s<menu id="%s" label="%s"%s execute="%s" />' % (
+                    ind, self.nid("pipe"), mlabel(label), icon_attr(icon), esc(cmd or "true")))
+            elif tag == "separator":
+                items.append('%s<separator />' % ind)
+            elif tag == "nop":
+                items.append('%s<separator label="%s" />' % (ind, mlabel(label)) if label
+                             else '%s<separator />' % ind)
+            elif tag in ("stylesmenu", "stylesdir"):
+                d = cmd or label or os.path.join(KFLUX, "styles")
+                items.append('%s<menu id="%s" label="%s"%s execute="kflux styles-menu %s" />' % (
+                    ind, self.nid("styles"), mlabel(label if (cmd and label) else "Styles"),
+                    icon_attr(icon), esc(shlex.quote(expand(d)))))
+            elif tag == "wallpapers":
+                d = cmd or label or "~/Pictures/Wallpapers"
+                items.append('%s<menu id="%s" label="%s"%s execute="kflux wallpapers-menu %s" />' % (
+                    ind, self.nid("wall"), mlabel(label if (cmd and label) else "Wallpapers"),
+                    icon_attr(icon), esc(shlex.quote(expand(d)))))
+            elif tag == "workspaces":
+                # labwc built-in; referencing it with a label would redefine it
+                items.append('%s<menu id="client-list-combined-menu" />' % ind)
+            elif tag == "config":
+                self.config_label = label or self.config_label
+                items.append('%s<menu id="kflux-config-menu" />' % ind)
+            elif tag == "reconfig":
+                items.append('%s<item label="%s"%s>\n%s\n%s</item>' % (
+                    ind, mlabel(label or "Reconfigure"), icon_attr(icon),
+                    actions_xml([("Execute", {"command": "kflux reconfigure"})], ind + "  "), ind))
+            elif tag == "restart":
+                items.append('%s<item label="%s"%s>\n%s\n%s</item>' % (
+                    ind, mlabel(label or "Restart"), icon_attr(icon),
+                    actions_xml([("Execute", {"command": "kflux reconfigure --restart-panels"})],
+                                ind + "  "), ind))
+            elif tag == "exit":
+                items.append('%s<item label="%s"%s>\n%s\n%s</item>' % (
+                    ind, mlabel(label or "Exit"), icon_attr(icon),
+                    actions_xml([("Exit", {})], ind + "  "), ind))
+            elif tag == "command":
+                items.append('%s<item label="%s"%s>\n%s\n%s</item>' % (
+                    ind, mlabel(label), icon_attr(icon),
+                    actions_xml(fb_action(cmd or ""), ind + "  "), ind))
+            elif tag in ("encoding", "endencoding"):
+                continue
+            else:
+                warn("menu tag [%s] not supported" % tag)
+        return items, i
+
+
+WINDOWMENU_MAP = {
+    "shade": ("Shade", [("ToggleShade", {})]), "stick": ("Stick", [("ToggleOmnipresent", {})]),
+    "maximize": ("Maximize", [("ToggleMaximize", {})]),
+    "iconify": ("Iconify", [("Iconify", {})]), "raise": ("Raise", [("Raise", {})]),
+    "lower": ("Lower", [("Lower", {})]), "close": ("Close", [("Close", {})]),
+    "kill": ("Kill", [("Kill", {})]),
+    "decor": ("Decorations", [("ToggleDecorations", {})]),
+    "fullscreen": ("Fullscreen", [("ToggleFullscreen", {})]),
+}
+
+
+def windowmenu_xml(path):
+    lines = []
+    if os.path.isfile(path):
+        lines = [l.strip() for l in open(path, encoding="utf-8") if l.strip()
+                 and not l.strip().startswith("#")]
+    else:
+        lines = ["[begin]", "[shade]", "[stick]", "[maximize]", "[iconify]", "[raise]",
+                 "[lower]", "[sendto]", "[layer]", "[separator]", "[close]", "[end]"]
+    items = []
+    for l in lines:
+        m = MENU_LINE.match(l)
+        if not m:
+            continue
+        tag, label, cmd = m.group(1).lower(), m.group(2), m.group(3)
+        if tag in WINDOWMENU_MAP:
+            name, acts = WINDOWMENU_MAP[tag]
+            items.append('    <item label="%s">\n%s\n    </item>' % (
+                esc(label or name), actions_xml(acts, "      ")))
+        elif tag == "sendto":
+            items.append('    <menu id="client-send-to-menu" />')
+        elif tag == "layer":
+            items.append('    <menu id="kflux-layer-menu" label="%s">\n'
+                         '      <item label="Above Dock (always on top)">\n'
+                         '        <action name="ToggleAlwaysOnTop" />\n      </item>\n'
+                         '      <item label="Bottom (always below)">\n'
+                         '        <action name="ToggleAlwaysOnBottom" />\n      </item>\n'
+                         '    </menu>' % esc(label or "Layer..."))
+        elif tag == "separator":
+            items.append("    <separator />")
+        elif tag == "exec":
+            items.append('    <item label="%s">\n%s\n    </item>' % (
+                esc(label or cmd), actions_xml([("Execute", {"command": cmd or ""})], "      ")))
+        elif tag in ("begin", "end", "alpha", "extramenus"):
+            continue
+    return '  <menu id="client-menu" label="">\n%s\n  </menu>' % "\n".join(items)
+
+
+def config_menu_xml(label="Configure"):
+    term = read_init().get("kflux.editor", "kate")
+    files = [("keys", "Keys"), ("apps", "Apps (window rules)"), ("menu", "Root menu"),
+             ("init", "Init (toolbar, slit, workspaces)"), ("slitlist", "Slit dockapps"),
+             ("windowmenu", "Window menu"), ("startup", "Startup")]
+    items = []
+    for f, what in files:
+        items.append('    <item label="Edit %s">\n      <action name="Execute" '
+                     'command="%s %s" />\n    </item>' % (
+                         esc(what), esc(term), esc(shlex.quote(os.path.join(KFLUX, f)))))
+    items.append("    <separator />")
+    fm = read_init().get("session.screen0.focusModel", "ClickFocus").lower()
+    items.append('    <item label="Focus: %s (toggle)">\n      <action name="Execute" '
+                 'command="kflux toggle-focus" />\n    </item>' % (
+                     "follows mouse" if "mouse" in fm else "click to focus"))
+    items.append('    <item label="Toolbar placement: top/bottom">\n      <action '
+                 'name="Execute" command="kflux toggle-toolbar" />\n    </item>')
+    items.append('    <item label="Slit on/off">\n      <action name="Execute" '
+                 'command="kflux toggle-slit" />\n    </item>')
+    items.append('    <menu id="kflux-keys-menu" label="Key bindings" execute="kflux keys-menu" />')
+    items.append("    <separator />")
+    items.append('    <item label="Reconfigure">\n      <action name="Execute" '
+                 'command="kflux reconfigure" />\n    </item>')
+    return '  <menu id="kflux-config-menu" label="%s">\n%s\n  </menu>' % (esc(label), "\n".join(items))
+
+
+# ---- rc.xml ----------------------------------------------------------------
+
+TITLE_BTN = {"stick": "desk", "shade": "shade", "minimize": "iconify", "maximize": "max",
+             "close": "close", "menuicon": "icon", "lhalf": None, "rhalf": None}
+
+
+def render_rc(st, init):
+    kb, mb = parse_keys(expand(init.get("session.keyFile", os.path.join(KFLUX, "keys"))))
+    rules, _ = parse_apps(expand(init.get("session.appsFile", os.path.join(KFLUX, "apps"))))
+    n = int(init.get("session.screen0.workspaces", "4") or 4)
+    names = [x.strip() for x in init.get("session.screen0.workspaceNames", "").split(",")
+             if x.strip()]
+    names += ["Workspace %d" % (i + 1) for i in range(len(names), n)]
+    focus = init.get("session.screen0.focusModel", "ClickFocus").lower()
+    follow = "yes" if "mouse" in focus else "no"
+    raise_ = "yes" if init.get("session.screen0.autoRaise", "true").lower() == "true" and follow == "yes" else "no"
+    placement = init.get("session.screen0.windowPlacement", "RowSmartPlacement").lower()
+    policy = ("cascade" if "cascade" in placement else "cursor" if "undermouse" in placement
+              else "center" if "center" in placement else "automatic")
+    snap = int(init.get("session.screen0.edgeSnapThreshold", "10") or 10)
+
+    def btns(side):
+        out = []
+        for b in init.get("session.screen0.titlebar.%s" % side, "").split():
+            v = TITLE_BTN.get(b.lower())
+            if v and v not in out:
+                out.append(v)
+        return out
+    left = btns("left") or ["desk"]
+    right = btns("right") or ["iconify", "max", "close"]
+    right = [b for b in right if b not in left]
+    layout = "%s:%s" % (",".join(left), ",".join(right))
+
+    def font(place, f):
+        return '    <font place="%s"><name>%s</name><size>%d</size><weight>%s</weight></font>' % (
+            place, esc(f["family"]), f["size"], "bold" if f["bold"] else "normal")
+
+    keys_xml = []
+    for key, acts in kb:
+        if acts:
+            keys_xml.append('    <keybind key="%s">\n%s\n    </keybind>' % (
+                esc(key), actions_xml(acts)))
+    # Hidden bindings the panels use to switch workspaces/windows.
+    for key, acts in (("XF86Launch8", [("GoToDesktop", {"to": "left", "wrap": "yes"})]),
+                      ("XF86Launch9", [("GoToDesktop", {"to": "right", "wrap": "yes"})]),
+                      ("XF86Launch6", [("PreviousWindow", {})]),
+                      ("XF86Launch7", [("NextWindow", {})])):
+        keys_xml.append('    <keybind key="%s">\n%s\n    </keybind>' % (key, actions_xml(acts)))
+
+    # Default frame/titlebar mouse behaviour (labwc defaults are replaced by ours).
+    base_mouse = {
+        "Frame": [("A-Left", "Press", [("Focus", {}), ("Raise", {})]),
+                  ("A-Left", "Drag", [("Move", {})]),
+                  ("A-Right", "Press", [("Focus", {}), ("Raise", {})]),
+                  ("A-Right", "Drag", [("Resize", {})]),
+                  ("W-Left", "Drag", [("Move", {})]), ("W-Right", "Drag", [("Resize", {})])],
+        "Client": [("Left", "Press", [("Focus", {}), ("Raise", {})]),
+                   ("Middle", "Press", [("Focus", {}), ("Raise", {})]),
+                   ("Right", "Press", [("Focus", {}), ("Raise", {})])],
+        "Title": [("Left", "Press", [("Focus", {}), ("Raise", {})]
+                   + ([("ActivateTab", {})] if labwc_has_tabs() else [])),
+                  ("Left", "Drag", [("Move", {})]),
+                  ("C-Left", "Drag", [("StartTabbing", {})] if labwc_has_tabs() else []),
+                  ("Left", "DoubleClick", [("ToggleShade", {})]),
+                  ("Middle", "Press", [("Lower", {})]),
+                  ("Right", "Click", [("Focus", {}), ("ShowMenu", {"menu": "client-menu"})]),
+                  ("Up", "Scroll", [("Shade", {})]), ("Down", "Scroll", [("Unshade", {})])],
+        "Border": [("Left", "Press", [("Focus", {}), ("Raise", {})]),
+                   ("Left", "Drag", [("Resize", {})])],
+        "Root": [("Left", "Press", []), ("Middle", "Press",
+                                         [("ShowMenu", {"menu": "client-list-combined-menu"})]),
+                 ("Right", "Press", [("ShowMenu", {"menu": "root-menu"})]),
+                 ("Up", "Scroll", [("GoToDesktop", {"to": "left", "wrap": "yes"})]),
+                 ("Down", "Scroll", [("GoToDesktop", {"to": "right", "wrap": "yes"})])],
+    }
+    for corner in ("Top", "Bottom", "Left", "Right", "TLCorner", "TRCorner", "BLCorner",
+                   "BRCorner"):
+        base_mouse[corner] = [("Left", "Press", [("Focus", {}), ("Raise", {})]),
+                              ("Left", "Drag", [("Resize", {})])]
+    for ctx, binds in mb.items():
+        merged = base_mouse.setdefault(ctx, [])
+        for b in binds:
+            merged[:] = [x for x in merged if not (x[0] == b[0] and x[1] == b[1])]
+            merged.append(b)
+    for btn, name in (("Iconify", "Iconify"), ("Maximize", "ToggleMaximize"),
+                      ("Close", "Close"), ("Shade", "ToggleShade"),
+                      ("AllDesktops", "ToggleOmnipresent")):
+        base_mouse[btn] = [("Left", "Click", [(name, {})])]
+    base_mouse["Icon"] = [("Left", "Click", [("ShowMenu", {"menu": "client-menu",
+                                                           "atCursor": "no"})])]
+    base_mouse["Maximize"].append(("Middle", "Click", [("ToggleMaximize",
+                                                        {"direction": "vertical"})]))
+    base_mouse["Maximize"].append(("Right", "Click", [("ToggleMaximize",
+                                                       {"direction": "horizontal"})]))
+    mouse_xml = []
+    for ctx, binds in base_mouse.items():
+        inner = []
+        for b, ev, acts in binds:
+            if acts:
+                inner.append('      <mousebind button="%s" action="%s">\n%s\n      </mousebind>'
+                             % (esc(b), ev, actions_xml(acts, "        ")) if b not in ("Up", "Down")
+                             and not b.endswith(("-Up", "-Down")) else
+                             '      <mousebind direction="%s" action="%s">\n%s\n      </mousebind>'
+                             % (esc(b), ev, actions_xml(acts, "        ")))
+            else:
+                inner.append('      <mousebind button="%s" action="%s" />' % (esc(b), ev))
+        mouse_xml.append('    <context name="%s">\n%s\n    </context>' % (ctx, "\n".join(inner)))
+
+    rc = """<?xml version="1.0"?>
+<!-- Generated by kflux from ~/.config/kflux (init, keys, apps). Do not edit;
+     edit those files and run `kflux apply` (or Reconfigure from the root menu). -->
+<labwc_config>
+  <core>
+    <decoration>server</decoration>
+    <gap>0</gap>
+  </core>
+  <placement><policy>%(policy)s</policy></placement>
+  <theme>
+    <name>%(theme)s</name>
+    <icon>%(icons)s</icon>
+    <titlebar><layout>%(layout)s</layout><showTitle>yes</showTitle></titlebar>
+    <cornerRadius>0</cornerRadius>
+    <keepBorder>yes</keepBorder>
+    <dropShadows>no</dropShadows>
+%(fonts)s
+  </theme>
+  <windowSwitcher preview="yes" outlines="yes" allWorkspaces="no">
+    <osd show="yes" style="classic" />
+    <fields>
+      <field content="icon" width="5%%" />
+      <field content="title" width="95%%" />
+    </fields>
+  </windowSwitcher>
+  <desktops number="%(n)d">
+    <names>
+%(names)s
+    </names>
+    <popupTime>600</popupTime>
+  </desktops>
+  <resistance>
+    <screenEdgeStrength>%(snap)d</screenEdgeStrength>
+    <windowEdgeStrength>%(snap)d</windowEdgeStrength>
+  </resistance>
+  <focus>
+    <followMouse>%(follow)s</followMouse>
+    <followMouseRequiresMovement>yes</followMouseRequiresMovement>
+    <raiseOnFocus>%(raise)s</raiseOnFocus>
+  </focus>
+  <snapping>
+    <range><inner>%(snap)d</inner><outer>%(snap)d</outer></range>
+    <topMaximize>no</topMaximize>
+  </snapping>
+  <menu><showIcons>yes</showIcons></menu>
+  <keyboard>
+    <repeatRate>30</repeatRate>
+    <repeatDelay>400</repeatDelay>
+%(keys)s
+  </keyboard>
+  <mouse>
+    <doubleClickTime>400</doubleClickTime>
+%(mouse)s
+  </mouse>
+  <windowRules>
+%(rules)s
+  </windowRules>
+</labwc_config>
+""" % {"policy": policy, "theme": GEN_THEME,
+       "icons": "breeze-dark" if st.dark() else "breeze", "layout": layout,
+       "fonts": "\n".join([font("ActiveWindow", st.win_font), font("InactiveWindow", st.win_font),
+                           font("MenuHeader", st.menu_title_font), font("MenuItem", st.menu_font),
+                           font("OnScreenDisplay", st.tb_font)]),
+       "n": n, "names": "\n".join("      <name>%s</name>" % esc(x) for x in names[:n]),
+       "snap": snap, "follow": follow, "raise": raise_,
+       "keys": "\n".join(keys_xml), "mouse": "\n".join(mouse_xml), "rules": apps_xml(rules)}
+    write(os.path.join(XDG_CONFIG, "labwc", "rc.xml"), rc)
+
+
+def render_menu(init):
+    mb = MenuBuilder()
+    root = mb.build(init.get("session.menuFile", os.path.join(KFLUX, "menu")))
+    wm = windowmenu_xml(expand(init.get("session.screen0.windowMenu",
+                                        os.path.join(KFLUX, "windowmenu"))))
+    xml = '<?xml version="1.0" encoding="UTF-8"?>\n<!-- Generated by kflux from ~/.config/kflux/menu -->\n<openbox_menu>\n%s\n%s\n%s\n</openbox_menu>\n' % (
+        config_menu_xml(mb.config_label), wm, root)
+    write(os.path.join(XDG_CONFIG, "labwc", "menu.xml"), xml)
+
+
+def render_autostart():
+    write(os.path.join(XDG_CONFIG, "labwc", "autostart"),
+          "# Generated by kflux. Put your own commands in ~/.config/kflux/startup.\n"
+          "kflux autostart >\"${XDG_CACHE_HOME:-$HOME/.cache}/kflux/autostart.log\" 2>&1 &\n")
+    write(os.path.join(XDG_CONFIG, "labwc", "environment"),
+          "# Generated by kflux (session environment is set by kflux-session)\n"
+          "XKB_DEFAULT_LAYOUT=%s\n" % read_init().get("kflux.keyboardLayout", "us"))
+
+
+# --------------------------------------------------------------------------
+# Session plumbing
+# --------------------------------------------------------------------------
+
+_INIT = None
+
+
+def read_init(reload=False):
+    global _INIT
+    if _INIT is None or reload:
+        db = ResourceDB.load(os.path.join(KFLUX, "init"))
+        _INIT = InitView(db)
+    return _INIT
+
+
+class InitView:
+    def __init__(self, db):
+        self.db = db
+        self.path = os.path.join(KFLUX, "init")
+
+    def get(self, key, default=None):
+        v = self.db.get(key)
+        return default if v in (None, "") else v
+
+    def set(self, key, value):
+        lines = open(self.path, encoding="utf-8").read().splitlines() if os.path.isfile(
+            self.path) else []
+        pat = re.compile(r"^\s*%s\s*:" % re.escape(key))
+        for i, l in enumerate(lines):
+            if pat.match(l):
+                lines[i] = "%s:\t%s" % (key, value)
+                break
+        else:
+            lines.append("%s:\t%s" % (key, value))
+        write(self.path, "\n".join(lines) + "\n")
+
+
+def current_style(init):
+    name = init.get("session.styleFile", "")
+    p = find_style(name)
+    if not p:
+        if name:
+            warn("style %r not found; using default" % name)
+        p = find_style(init.get("kflux.defaultStyle", "kflux-Carbon")) or find_style("bloe")
+    return Style(p)
+
+
+def apply(reload=True, restart_panels=False):
+    WARNINGS.clear()
+    init = read_init(reload=True)
+    st = current_style(init)
+    render_theme(st, init)
+    render_rc(st, init)
+    render_menu(init)
+    render_autostart()
+    render_toolbar(st, init)
+    render_slit(st, init)
+    render_kde_colors(st)
+    render_misc(st)
+    render_konsole(st)
+    render_conky(st, init)
+    write(os.path.join(XDG_CACHE, "kflux", "warnings.txt"),
+          "".join(w + "\n" for w in sorted(set(WARNINGS))))
+    if reload and os.environ.get("WAYLAND_DISPLAY"):
+        run(["labwc", "--reconfigure"])
+        start_panels(restart=True)
+        start_wallpaper(restart=True)
+        start_conky(restart=True)
+        run(["makoctl", "reload"])
+        # Tell running KDE/Qt apps the palette changed.
+        run(["dbus-send", "--session", "--type=signal", "/KGlobalSettings",
+             "org.kde.KGlobalSettings.notifyChange", "int32:0", "int32:0"])
+        run(["dbus-send", "--session", "--type=signal", "/KIconLoader",
+             "org.kde.KIconLoader.iconChanged", "int32:0"])
+    return st
+
+
+def run(argv, **kw):
+    """subprocess.run that tolerates missing programs."""
+    if not shutil.which(argv[0]):
+        return None
+    kw.setdefault("stderr", subprocess.DEVNULL)
+    kw.setdefault("stdout", subprocess.DEVNULL)
+    return subprocess.run(argv, **kw)
+
+
+def spawn(name, argv):
+    if not (shutil.which(argv[0]) or os.access(argv[0], os.X_OK)):
+        warn("%s not installed; skipped" % argv[0])
+        return None
+    logdir = os.path.join(XDG_CACHE, "kflux")
+    os.makedirs(logdir, exist_ok=True)
+    log = open(os.path.join(logdir, name + ".log"), "ab")
+    p = subprocess.Popen(argv, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                         start_new_session=True)
+    write(os.path.join(logdir, name + ".pid"), str(p.pid))
+    write(os.path.join(logdir, name + ".cmd"), " ".join(argv))
+    return p
+
+
+def stop(name):
+    """Stop a helper: its recorded pid and any other copy of the same command."""
+    d = os.path.join(XDG_CACHE, "kflux")
+    pidf, cmdf = os.path.join(d, name + ".pid"), os.path.join(d, name + ".cmd")
+    if os.path.isfile(pidf):
+        try:
+            os.kill(int(open(pidf).read().strip()), signal.SIGTERM)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+        os.remove(pidf)
+    if os.path.isfile(cmdf):
+        run(["pkill", "-u", str(os.getuid()), "-x", "-f", open(cmdf).read().strip()])
+
+
+def wait_for_log(name, offset, text, timeout=8.0):
+    """Wait until `text` appears in a panel's log after `offset` bytes."""
+    import time
+    path = os.path.join(XDG_CACHE, "kflux", name + ".log")
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with open(path, "rb") as f:
+                f.seek(offset)
+                if text in f.read():
+                    return True
+        except OSError:
+            pass
+        time.sleep(0.2)
+    return False
+
+
+def start_panels(restart=False):
+    gen = os.path.join(KFLUX, "generated")
+    init = read_init()
+    if restart:
+        stop("slit")
+        stop("toolbar")
+    logp = os.path.join(XDG_CACHE, "kflux", "toolbar.log")
+    off = os.path.getsize(logp) if os.path.isfile(logp) else 0
+    spawn("toolbar", ["waybar", "-c", os.path.join(gen, "toolbar.json"),
+                      "-s", os.path.join(gen, "toolbar.css")])
+    if init.get("kflux.slit.visible", "true").lower() == "false" or not read_slitlist():
+        return
+    # Map the slit only after the toolbar has its exclusive zone.
+    wait_for_log("toolbar", off, b"Bar configured")
+    logp = os.path.join(XDG_CACHE, "kflux", "slit.log")
+    off = os.path.getsize(logp) if os.path.isfile(logp) else 0
+    spawn("slit", ["waybar", "-c", os.path.join(gen, "slit.json"),
+                   "-s", os.path.join(gen, "slit.css")])
+    wait_for_log("slit", off, b"Bar configured")
+
+
+def start_wallpaper(restart=False):
+    if restart:
+        stop("wallpaper")
+    argsf = os.path.join(XDG_CACHE, "kflux", "wallpaper.args")
+    args = json.load(open(argsf)) if os.path.isfile(argsf) else ["-c", "#202020"]
+    spawn("wallpaper", ["swaybg"] + args)
+
+
+def autostart():
+    env = {k: os.environ.get(k, "") for k in ("WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP",
+                                               "XDG_SESSION_TYPE", "DISPLAY",
+                                               "QT_QPA_PLATFORMTHEME", "XDG_MENU_PREFIX",
+                                               "QT_QUICK_BACKEND", "KDE_SESSION_VERSION")}
+    run(["dbus-update-activation-environment", "--systemd"] +
+        ["%s=%s" % kv for kv in env.items() if kv[1]])
+    apply(reload=False)  # output size is known now; refresh panel geometry
+    start_wallpaper()
+    start_panels()
+    spawn("mako", ["mako"])
+    start_conky()
+    for name, argv in (("polkit", ["/usr/lib/polkit-kde-authentication-agent-1"]),
+                       ("nm-applet", ["nm-applet", "--indicator"]),
+                       ("kdeconnect", ["kdeconnect-indicator"])):
+        if shutil.which(argv[0]) or os.path.exists(argv[0]):
+            spawn(name, argv)
+    spawn("kbuildsycoca", ["kbuildsycoca6", "--noincremental"])
+    marker = os.path.join(XDG_CACHE, "kflux", "first-run")
+    if os.path.isfile(marker):
+        os.remove(marker)
+        run(["notify-send", "-a", "kflux", "-t", "0", "Welcome to kflux", WELCOME])  # stays until dismissed
+    idle = int(read_init().get("kflux.lockAfterMinutes", "0") or 0)
+    if idle > 0:
+        spawn("swayidle", ["swayidle", "-w", "timeout", str(idle * 60), "swaylock -f",
+                           "before-sleep", "swaylock -f"])
+    _, startup = parse_apps(expand(read_init().get("session.appsFile",
+                                                   os.path.join(KFLUX, "apps"))))
+    for i, cmd in enumerate(startup):
+        spawn("apps-startup-%d" % i, ["sh", "-c", cmd])
+    su = os.path.join(KFLUX, "startup")
+    if os.path.isfile(su):
+        spawn("startup", ["sh", su])
+
+
+# --------------------------------------------------------------------------
+# Pipe menus and small commands
+# --------------------------------------------------------------------------
+
+def styles_menu(dirs):
+    dirs = dirs or STYLE_DIRS
+    cur = read_init().get("session.styleFile", "")
+    out = ['<?xml version="1.0" encoding="UTF-8"?>', "<openbox_pipe_menu>"]
+    seen = set()
+    for d in dirs:
+        d = expand(d)
+        if not os.path.isdir(d):
+            continue
+        entries = sorted(os.listdir(d), key=str.lower)
+        if entries and len(dirs) > 1:
+            out.append('  <separator label="%s" />' % esc(d.replace(HOME, "~")))
+        for e in entries:
+            p = os.path.join(d, e)
+            if e.startswith(".") or e in seen or not (os.path.isfile(p) or style_file(p)):
+                continue
+            seen.add(e)
+            mark = "• " if os.path.realpath(expand(cur) or "") == os.path.realpath(p) or cur == e else ""
+            out.append('  <item label="%s%s">\n    <action name="Execute" command="kflux style %s" />\n  </item>'
+                       % (esc(mark), mlabel(e), esc(shlex.quote(p))))
+    out.append("</openbox_pipe_menu>")
+    print("\n".join(out))
+
+
+def wallpapers_menu(d):
+    d = expand(d)
+    out = ['<?xml version="1.0" encoding="UTF-8"?>', "<openbox_pipe_menu>",
+           '  <item label="Use style background">\n    <action name="Execute" '
+           'command="kflux wallpaper --clear" />\n  </item>']
+    if os.path.isdir(d):
+        for e in sorted(os.listdir(d), key=str.lower):
+            if e.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                out.append('  <item label="%s">\n    <action name="Execute" '
+                           'command="kflux wallpaper %s" />\n  </item>' % (
+                               mlabel(e), esc(shlex.quote(os.path.join(d, e)))))
+    out.append("</openbox_pipe_menu>")
+    print("\n".join(out))
+
+
+CATEGORIES = [("AudioVideo", "Multimedia"), ("Development", "Development"),
+              ("Education", "Education"), ("Game", "Games"), ("Graphics", "Graphics"),
+              ("Network", "Internet"), ("Office", "Office"), ("Science", "Science"),
+              ("Settings", "Settings"), ("System", "System"), ("Utility", "Utilities")]
+
+
+def apps_menu():
+    dirs = [os.path.join(XDG_DATA, "applications")] + [
+        os.path.join(d, "applications") for d in os.environ.get(
+            "XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":")]
+    apps = {}
+    desktops = set(os.environ.get("XDG_CURRENT_DESKTOP", "").split(":"))
+    for d in dirs:
+        for p in glob.glob(os.path.join(d, "**", "*.desktop"), recursive=True):
+            fid = os.path.relpath(p, d).replace("/", "-")
+            if fid in apps:
+                continue
+            e = {}
+            sec = None
+            for line in open(p, encoding="utf-8", errors="replace"):
+                line = line.strip()
+                if line.startswith("["):
+                    sec = line
+                    continue
+                if sec == "[Desktop Entry]" and "=" in line:
+                    k, v = line.split("=", 1)
+                    e.setdefault(k.strip(), v.strip())
+            apps[fid] = e
+    groups = {}
+    for fid, e in apps.items():
+        if e.get("Type") != "Application" or e.get("NoDisplay") == "true" or \
+                e.get("Hidden") == "true" or not e.get("Exec"):
+            continue
+        only = set(filter(None, e.get("OnlyShowIn", "").split(";")))
+        if only and not (only & desktops):
+            continue
+        if set(filter(None, e.get("NotShowIn", "").split(";"))) & desktops:
+            continue
+        cats = e.get("Categories", "").split(";")
+        label = next((l for c, l in CATEGORIES if c in cats), "Other")
+        cmd = re.sub(r"\s*%[fFuUdDnNickvm]", "", e["Exec"]).replace("%%", "%")
+        groups.setdefault(label, []).append((e.get("Name", fid), cmd, e.get("Icon", "")))
+    out = ['<?xml version="1.0" encoding="UTF-8"?>', "<openbox_pipe_menu>"]
+    for label in [l for _, l in CATEGORIES] + ["Other"]:
+        if label not in groups:
+            continue
+        out.append('  <menu id="kflux-apps-%s" label="%s">' % (esc(label.lower()), esc(label)))
+        for name, cmd, icon in sorted(groups[label], key=lambda x: x[0].lower()):
+            out.append('    <item label="%s"%s>\n      <action name="Execute" command="%s" />\n    </item>'
+                       % (mlabel(name), icon_attr(icon), esc(cmd)))
+        out.append("  </menu>")
+    out.append("</openbox_pipe_menu>")
+    print("\n".join(out))
+
+
+KCMS = {"network": "kcm_networkmanagement", "audio": "kcm_pulseaudio",
+        "bluetooth": "kcm_bluetooth", "clock": "kcm_clock", "colors": "kcm_colors",
+        "icons": "kcm_icons", "fonts": "kcm_fonts", "keyboard": "kcm_keyboard",
+        "mouse": "kcm_mouse", "kdeconnect": "kcm_kdeconnect", "power": "kcm_powerdevilprofilesconfig",
+        "users": "kcm_users", "printers": "kcm_printer_manager"}
+
+
+def press(keysym):
+    run(["wtype", "-k", keysym])
+
+
+WELCOME = ("Right-click the desktop for the menu (or Super+Space). Alt+F1 opens a "
+           "terminal, Alt+F2 runs a program. Your setup lives in ~/.config/kflux in "
+           "Fluxbox's file formats: menu → kflux → Configure to edit, Reload config "
+           "to apply, System Styles to change the look.")
+KEYS_DIRS = [os.path.join(KFLUX, "keys.d"), os.path.join(SYSTEM, "keys.d")]
+
+
+def key_presets():
+    out = {}
+    for d in reversed(KEYS_DIRS):
+        if os.path.isdir(d):
+            for e in sorted(os.listdir(d)):
+                if not e.startswith("."):
+                    out[e] = os.path.join(d, e)
+    return out
+
+
+def keys_command(preset):
+    presets = key_presets()
+    curf = os.path.join(KFLUX, ".keys-preset")
+    cur = open(curf).read().strip() if os.path.isfile(curf) else "custom"
+    if not preset:
+        for name in presets:
+            print("%s %s" % ("*" if name == cur else " ", name))
+        print("current: %s (%s)" % (cur, os.path.join(KFLUX, "keys")))
+        return
+    src = presets.get(preset) or (expand(preset) if os.path.isfile(expand(preset)) else None)
+    if not src:
+        sys.exit("kflux: no key preset %r (have: %s)" % (preset, ", ".join(presets)))
+    dst = os.path.join(KFLUX, "keys")
+    if os.path.isfile(dst) and cur == "custom":
+        shutil.copy(dst, dst + ".bak")   # keep the user's own file
+    shutil.copy(src, dst)
+    write(curf, (preset if preset in presets else "custom") + "\n")
+    apply()
+    run(["notify-send", "-a", "kflux", "Key bindings", "Now using: %s" % preset])
+
+
+def keys_menu():
+    curf = os.path.join(KFLUX, ".keys-preset")
+    cur = open(curf).read().strip() if os.path.isfile(curf) else "custom"
+    out = ['<?xml version="1.0" encoding="UTF-8"?>', "<openbox_pipe_menu>"]
+    for name in key_presets():
+        out.append('  <item label="%s%s">\n    <action name="Execute" command="kflux keys %s" />\n  </item>'
+                   % ("• " if name == cur else "", mlabel(name), esc(shlex.quote(name))))
+    out.append('  <separator />')
+    out.append('  <item label="Edit keys">\n    <action name="Execute" command="%s %s" />\n  </item>'
+               % (esc(read_init().get("kflux.editor", "kate")),
+                  esc(shlex.quote(os.path.join(KFLUX, "keys")))))
+    out.append("</openbox_pipe_menu>")
+    print("\n".join(out))
+
+
+def doctor():
+    """Check what a working kflux session needs. Returns the number of failures."""
+    fails = 0
+
+    def line(level, msg):
+        nonlocal fails
+        fails += level == "FAIL"
+        print("%-4s  %s" % (level, msg))
+    print("kflux %s" % VERSION)
+    for cmd in ("labwc", "waybar", "swaybg", "mako", "wtype", "wlr-randr", "python3"):
+        line("ok" if shutil.which(cmd) else "FAIL", "required: %s" % cmd)
+    line("ok" if labwc_has_tabs() else "warn",
+         "window tabs (labwc-kflux)" if labwc_has_tabs()
+         else "window tabs: install labwc-kflux (stock labwc has no tabs)")
+    for cmd, why in (("konsole", "terminal"), ("dolphin", "files"), ("krunner", "run dialog"),
+                     ("systemsettings", "KDE settings"), ("kate", "config editor"),
+                     ("nm-applet", "network tray"), ("kdeconnect-indicator", "KDE Connect"),
+                     ("conky", "desktop stats"), ("swaylock", "screen lock"),
+                     ("notify-send", "notifications")):
+        line("ok" if shutil.which(cmd) else "warn", "optional: %s (%s)" % (cmd, why))
+    if not os.path.isdir(FLUXBOX_STYLES):
+        line("warn", "classic styles missing: install the 'fluxbox' package for %s" % FLUXBOX_STYLES)
+    for f in ("init", "keys", "apps", "menu"):
+        line("ok" if os.path.isfile(os.path.join(KFLUX, f)) else "FAIL",
+             "config: ~/.config/kflux/%s" % f)
+    w = os.path.join(XDG_CACHE, "kflux", "warnings.txt")
+    n = len([l for l in open(w)]) if os.path.isfile(w) else 0
+    line("ok" if n == 0 else "warn", "translation warnings: %d (kflux warnings)" % n)
+    if os.environ.get("WAYLAND_DISPLAY"):
+        desk = os.environ.get("XDG_CURRENT_DESKTOP", "")
+        line("ok" if "kflux" in desk else "warn", "XDG_CURRENT_DESKTOP=%s" % desk)
+        line("ok" if os.environ.get("QT_QPA_PLATFORMTHEME") == "kde" else "warn",
+             "KDE platform theme for Qt apps (QT_QPA_PLATFORMTHEME=kde)")
+        for name in ("toolbar", "slit", "mako", "wallpaper"):
+            pidf = os.path.join(XDG_CACHE, "kflux", name + ".pid")
+            alive = False
+            if os.path.isfile(pidf):
+                try:
+                    os.kill(int(open(pidf).read()), 0)
+                    alive = True
+                except (OSError, ValueError):
+                    pass
+            line("ok" if alive else "warn", "running: %s" % name)
+        sid = os.environ.get("XDG_SESSION_ID", "")
+        seat = subprocess.run(["loginctl", "show-session", sid, "-p", "Seat", "--value"],
+                              capture_output=True, text=True).stdout.strip() if sid else ""
+        line("ok" if seat else "warn", "logind seat: %s%s" % (
+            seat or "none", "" if seat else " (polkit may ask for passwords; log in "
+            "through a display manager such as SDDM)"))
+    else:
+        line("info", "not inside a Wayland session; session checks skipped")
+    return fails
+
+
+def init_user(force=False, reload=True):
+    first = not os.path.isfile(os.path.join(KFLUX, "init"))
+    os.makedirs(KFLUX, exist_ok=True)
+    if first:
+        write(os.path.join(XDG_CACHE, "kflux", "first-run"), "1\n")
+    skel = os.path.join(SYSTEM, "skel")
+    for f in os.listdir(skel):
+        dst = os.path.join(KFLUX, f)
+        if force or not os.path.exists(dst):
+            src = os.path.join(skel, f)
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy(src, dst)
+    os.makedirs(os.path.join(KFLUX, "styles"), exist_ok=True)
+    if first or force:
+        write(os.path.join(KFLUX, ".keys-preset"), "kflux\n")
+    apply(reload=reload)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="kflux", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("init", help="seed ~/.config/kflux from defaults and apply")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--no-reload", action="store_true")
+    p = sub.add_parser("apply", help="render generated configs from ~/.config/kflux")
+    p.add_argument("--no-reload", action="store_true")
+    p = sub.add_parser("reconfigure", help="apply and reload the running session")
+    p.add_argument("--restart-panels", action="store_true")
+    p = sub.add_parser("style", help="switch to a Fluxbox style (path or name)")
+    p.add_argument("style")
+    p = sub.add_parser("styles-menu", help="pipe menu of styles")
+    p.add_argument("dirs", nargs="*")
+    p = sub.add_parser("wallpapers-menu", help="pipe menu of wallpapers")
+    p.add_argument("dir")
+    p = sub.add_parser("wallpaper", help="override the style background")
+    p.add_argument("path", nargs="?")
+    p.add_argument("--clear", action="store_true")
+    sub.add_parser("apps-menu", help="pipe menu of installed applications")
+    sub.add_parser("autostart", help="start session helpers (run by labwc)")
+    p = sub.add_parser("ws", help="switch workspace (used by the toolbar)")
+    p.add_argument("dir", choices=["prev", "next"])
+    p = sub.add_parser("win", help="cycle windows (used by the toolbar)")
+    p.add_argument("dir", choices=["prev", "next"])
+    p = sub.add_parser("exec-kcm", help="open a KDE settings module")
+    p.add_argument("name")
+    sub.add_parser("toggle-focus")
+    sub.add_parser("toggle-toolbar")
+    sub.add_parser("toggle-slit")
+    sub.add_parser("warnings", help="show what could not be translated")
+    p = sub.add_parser("keys", help="list key binding presets, or switch to one")
+    p.add_argument("preset", nargs="?")
+    sub.add_parser("keys-menu", help="pipe menu of key binding presets")
+    sub.add_parser("styles", help="list available styles")
+    sub.add_parser("doctor", help="check dependencies and the running session")
+    sub.add_parser("version", help="print the kflux version")
+    p = sub.add_parser("dump-style", help="debug: show resolved style values")
+    p.add_argument("style")
+    a = ap.parse_args()
+
+    if a.cmd == "init":
+        init_user(force=a.force, reload=not a.no_reload)
+    elif a.cmd == "apply":
+        apply(reload=not a.no_reload)
+    elif a.cmd == "reconfigure":
+        apply(reload=True, restart_panels=a.restart_panels)
+    elif a.cmd == "style":
+        p = find_style(a.style)
+        if not p:
+            sys.exit("kflux: style not found: %s" % a.style)
+        read_init().set("session.styleFile", p)
+        st = apply()
+        run(["notify-send", "-a", "kflux", "Style", st.name])
+    elif a.cmd == "styles-menu":
+        styles_menu(a.dirs)
+    elif a.cmd == "wallpapers-menu":
+        wallpapers_menu(a.dir)
+    elif a.cmd == "wallpaper":
+        read_init().set("kflux.wallpaper", "" if a.clear or not a.path else os.path.abspath(a.path))
+        apply()
+    elif a.cmd == "apps-menu":
+        apps_menu()
+    elif a.cmd == "autostart":
+        autostart()
+    elif a.cmd == "ws":
+        press("XF86Launch8" if a.dir == "prev" else "XF86Launch9")
+    elif a.cmd == "win":
+        press("XF86Launch6" if a.dir == "prev" else "XF86Launch7")
+    elif a.cmd == "exec-kcm":
+        kcm = KCMS.get(a.name, a.name)
+        spawn("kcm", ["systemsettings", kcm])
+    elif a.cmd == "toggle-focus":
+        init = read_init()
+        cur = init.get("session.screen0.focusModel", "ClickFocus")
+        init.set("session.screen0.focusModel",
+                 "ClickFocus" if "mouse" in cur.lower() else "MouseFocus")
+        apply()
+    elif a.cmd == "toggle-toolbar":
+        init = read_init()
+        cur = init.get("session.screen0.toolbar.placement", "BottomCenter")
+        init.set("session.screen0.toolbar.placement",
+                 cur.replace("Bottom", "Top") if cur.startswith("Bottom") else
+                 cur.replace("Top", "Bottom"))
+        apply()
+    elif a.cmd == "toggle-slit":
+        init = read_init()
+        cur = init.get("kflux.slit.visible", "true").lower()
+        init.set("kflux.slit.visible", "false" if cur == "true" else "true")
+        apply()
+    elif a.cmd == "keys":
+        keys_command(a.preset)
+    elif a.cmd == "keys-menu":
+        keys_menu()
+    elif a.cmd == "styles":
+        cur = os.path.realpath(expand(read_init().get("session.styleFile", "")) or "/")
+        for d in STYLE_DIRS:
+            if os.path.isdir(d):
+                print("%s:" % d.replace(HOME, "~"))
+                for e in sorted(os.listdir(d), key=str.lower):
+                    pth = os.path.join(d, e)
+                    if not e.startswith(".") and (os.path.isfile(pth) or style_file(pth)):
+                        print("  %s %s" % ("*" if os.path.realpath(pth) == cur else " ", e))
+    elif a.cmd == "doctor":
+        sys.exit(doctor())
+    elif a.cmd == "version":
+        print("kflux", VERSION)
+    elif a.cmd == "warnings":
+        p = os.path.join(XDG_CACHE, "kflux", "warnings.txt")
+        text = open(p).read() if os.path.isfile(p) else ""
+        print(text.rstrip() or "no warnings")
+    elif a.cmd == "dump-style":
+        st = Style(find_style(a.style) or a.style)
+        for k, v in sorted(vars(st).items()):
+            if isinstance(v, Texture):
+                v = "%s %s->%s text=%s pic=%s" % (v.spec, v.color, v.color_to, v.text, v.pic)
+            if k != "db":
+                print("%-18s %s" % (k, v))
+        print("warnings:", sorted(set(WARNINGS)))
+
+
+if __name__ == "__main__":
+    main()

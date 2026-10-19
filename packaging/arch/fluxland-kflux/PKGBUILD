@@ -1,0 +1,62 @@
+# PARKED (decisions/0003): not part of the 1.0 release; the dev image still builds it.
+# Maintainer: kflux contributors
+# AUR-ready PKGBUILD for fluxland-kflux: ecliptik/fluxland (MIT) at a pinned
+# commit, ported to wlroots 0.20 by kflux's third_party/patches/
+# fluxland-wlroots-0.20.patch, plus the "fluxland (kflux)" session.
+# Before publishing: tag v$_kfluxver, replace sha256sums (updpkgsums).
+# Local test: FLUXLAND_SRC=file:///path/fluxland.tar.gz KFLUX_SRC=file:///path/kflux.tar.gz makepkg -f
+# build/container/build-image.sh builds the image's copy this way.
+_owner=endthestart
+pkgname=fluxland-kflux
+pkgver=1.1.0
+pkgrel=1
+_commit=32d1009d667698380a73f5b80e6536e74fd6da1e
+_kfluxver=0.1.0
+pkgdesc='Fluxbox-style Wayland compositor with tabs (ecliptik/fluxland on wlroots 0.20), as a kflux session'
+arch=('x86_64')
+url='https://github.com/ecliptik/fluxland'
+license=('MIT')
+depends=(
+  'kflux'
+  'wlroots0.20' 'wayland' 'libxkbcommon' 'pango' 'cairo' 'libinput' 'libdrm'
+  'pixman' 'xcb-util-wm' 'systemd-libs' 'libpipewire' 'gdk-pixbuf2'
+)
+makedepends=('meson' 'ninja' 'wayland-protocols')
+optdepends=(
+  'xorg-xwayland: X11 apps'
+  'foot: the clock and load dockapps in the slit'
+)
+provides=('fluxland')
+conflicts=('fluxland')
+_fluxland_src="${FLUXLAND_SRC:-https://github.com/ecliptik/fluxland/archive/${_commit}.tar.gz}"
+_kflux_src="${KFLUX_SRC:-https://github.com/${_owner}/kflux/archive/refs/tags/v${_kfluxver}.tar.gz}"
+source=("fluxland-${_commit}.tar.gz::${_fluxland_src}"
+        "kflux-${_kfluxver}.tar.gz::${_kflux_src}")
+sha256sums=('SKIP' 'SKIP')
+
+prepare() {
+  cd "fluxland-${_commit}"
+  patch -Np1 -i "../kflux-${_kfluxver}/third_party/patches/fluxland-wlroots-0.20.patch"
+  # The unit tests stub wlroots 0.18's API and are not part of the package.
+  sed -i "s/^subdir('tests')/# &/" meson.build
+}
+
+build() {
+  arch-meson "fluxland-${_commit}" build -Dxwayland=enabled -Dman-pages=disabled
+  # gcc occasionally segfaults in an emulated x86_64 builder (the image build
+  # on Apple Silicon); a second run resumes where the first stopped.
+  meson compile -C build || meson compile -C build
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+  # The session below replaces upstream's bare session and launcher entry.
+  rm -f "$pkgdir/usr/share/wayland-sessions/fluxland-session.desktop" \
+        "$pkgdir/usr/share/applications/fluxland.desktop"
+  install -Dm644 "fluxland-${_commit}/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  cd "kflux-${_kfluxver}"
+  install -Dm755 overlay/usr/bin/fluxland-kflux-session "$pkgdir/usr/bin/fluxland-kflux-session"
+  install -Dm644 overlay/usr/share/wayland-sessions/fluxland-kflux.desktop \
+    "$pkgdir/usr/share/wayland-sessions/fluxland-kflux.desktop"
+}

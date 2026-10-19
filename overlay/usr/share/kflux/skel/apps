@@ -1,0 +1,32 @@
+# kflux apps -- Fluxbox apps(5) syntax: per-window rules and startup programs.
+# Match on (name=...) (class=...) (title=...); on Wayland "class" is the app id.
+# Supported: Workspace Dimensions Position Layer Sticky Shaded Maximized
+#            Minimized Fullscreen Deco IconHidden FocusHidden, and [group]
+# Not available on labwc: Tab (per-window tab on/off), Alpha, Head.
+
+# KRunner floats above everything, like fbrun did
+[app] (class=org.kde.krunner)
+  [Deco]	{NONE}
+  [Layer]	{2}
+[end]
+
+# System Settings opens centred
+[app] (class=systemsettings)
+  [Position]	(CENTER)	{0 0}
+  [Dimensions]	{1000 640}
+[end]
+
+# Examples:
+# [app] (class=konsole) (title=scratch)
+#   [Workspace]	{1}
+#   [Dimensions]	{640 400}
+#   [Position]	(UPPERRIGHT)	{0 0}
+#   [Sticky]	{yes}
+# [end]
+# [startup] {konsole --hold -e htop}
+#
+# Open Konsole and Dolphin windows as tabs of one window:
+# [group] (workspace)
+#   [app] (class=org.kde.konsole)
+#   [app] (class=org.kde.dolphin)
+# [end]

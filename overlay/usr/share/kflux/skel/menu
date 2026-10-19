@@ -1,0 +1,40 @@
+# kflux root menu -- Fluxbox menu(5) syntax, right-click the desktop.
+# kflux extension: [pipe] (Label) {command} runs an openbox-style pipe menu.
+[begin] (kflux)
+  [exec] (Terminal) {xterm} <utilities-terminal>
+  [exec] (Files) {dolphin} <system-file-manager>
+  [exec] (Editor) {kate} <accessories-text-editor>
+  [exec] (Run...) {fbrun} <system-run>
+  [separator]
+  [pipe] (Applications) {kflux apps-menu} <applications-all>
+  [submenu] (KDE)
+    [exec] (System Settings) {systemsettings} <preferences-system>
+    [exec] (Network) {kflux exec-kcm network} <preferences-system-network>
+    [exec] (Audio) {kflux exec-kcm audio} <audio-card>
+    [exec] (Displays) {wdisplays} <preferences-desktop-display>
+    [exec] (KDE Connect) {kdeconnect-app} <kdeconnect>
+    [exec] (Wallet) {kwalletmanager5} <kwalletmanager>
+    [exec] (Colours / Icons / Fonts) {systemsettings kcm_colors} <preferences-desktop-color>
+  [end]
+  [separator]
+  [submenu] (kflux)
+    [config] (Configure)
+    [submenu] (System Styles)
+      [stylesdir] (/usr/share/fluxbox/styles)
+    [end]
+    [submenu] (kflux Styles)
+      [stylesdir] (/usr/share/kflux/styles)
+    [end]
+    [submenu] (User Styles)
+      [stylesdir] (~/.config/kflux/styles)
+    [end]
+    [wallpapers] (~/Pictures/Wallpapers)
+    [workspaces] (Workspace List)
+    [reconfig] (Reload config)
+    [restart] (Restart)
+    [exec] (About) {kate /usr/share/doc/kflux/README.md}
+  [end]
+  [separator]
+  [exec] (Lock) {swaylock -f} <system-lock-screen>
+  [exit] (Exit)
+[end]

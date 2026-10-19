@@ -1,0 +1,92 @@
+#!/bin/sh
+# fluxland (kflux) session: ecliptik/fluxland, which has real Fluxbox tabs,
+# keymodes, toolbar and slit, reading the same ~/.config/kflux files as the
+# kflux session, with the same KDE apps and services behind it.
+#
+# fluxland reads ~/.config/fluxland. That directory is regenerated from
+# ~/.config/kflux at every login, so edit the kflux files, not these copies.
+export XDG_CURRENT_DESKTOP=fluxland:KDE
+export XDG_SESSION_DESKTOP=fluxland
+. /usr/lib/kflux/session-env
+
+K="${XDG_CONFIG_HOME:-$HOME/.config}/kflux"
+F="${XDG_CONFIG_HOME:-$HOME/.config}/fluxland"
+LOG="${XDG_CACHE_HOME:-$HOME/.cache}/kflux/fluxland.log"
+mkdir -p "$F" && chmod 700 "$F"
+
+initval() { sed -n "s/^$1:[[:space:]]*//p" "$K/init" | tail -1; }
+term=$(initval kflux.terminal); term=${term:-konsole}
+runner=$(initval kflux.runner); runner=${runner:-krunner}
+
+# The kflux translator maps Fluxbox's xterm and fbrun to kflux.terminal and
+# kflux.runner; do the same for fluxland, which executes commands verbatim.
+subst() {
+    sed -E -e "s/(^|[^[:alnum:]_.-])xterm([^[:alnum:]_.-]|$)/\\1$term\\2/g" \
+           -e "s/(^|[^[:alnum:]_.-])fbrun([^[:alnum:]_.-]|$)/\\1$runner\\2/g" "$1"
+}
+subst "$K/menu" > "$F/menu"
+
+# keys: the kflux keys, plus the Fluxbox 1.3.7 default bindings that kflux
+# leaves out because labwc cannot do them (tabs) or does them natively
+# (titlebar drag, grips). A trigger the kflux file already binds is skipped.
+subst "$K/keys" > "$F/keys"
+awk -F' :' '
+    FNR == NR { if ($0 !~ /^[[:space:]]*(#|!|$)/) bound[$1] = 1; next }
+    /^#/ || !($1 in bound)
+' "$F/keys" - > "$F/keys.fluxbox" <<'EOF'
+# --- Fluxbox 1.3.7 defaults that the kflux keys file omits ---
+OnToolbar Mouse4 :PrevWindow {static groups} (iconhidden=no)
+OnToolbar Mouse5 :NextWindow {static groups} (iconhidden=no)
+OnWindowBorder Move1 :StartMoving
+OnLeftGrip Move1 :StartResizing bottomleft
+OnRightGrip Move1 :StartResizing bottomright
+OnTitlebar Control Mouse1 :StartTabbing
+OnTitlebar Mouse1 :MacroCmd {Raise} {Focus} {ActivateTab}
+OnTitlebar Move1 :StartMoving
+Mod4 Tab :NextTab
+Mod4 Shift Tab :PrevTab
+EOF
+cat "$F/keys.fluxbox" >> "$F/keys" && rm -f "$F/keys.fluxbox"
+
+# apps: the kflux rules, plus docking for the small slit dockapps below.
+{ cat "$K/apps"; printf '\n[app] (class=kflux-dock-.*)\n  [Dock]\t{yes}\n[end]\n'; } > "$F/apps"
+
+# init: the kflux init with fluxland's own copies of keys, menu and apps,
+# without the kflux.* extras, and with layer names as the numbers fluxland
+# expects (Fluxbox accepts both).
+sed -E -e "s|^(session\.keyFile:).*|\\1\t$F/keys|" \
+       -e "s|^(session\.menuFile:).*|\\1\t$F/menu|" \
+       -e "s|^(session\.appsFile:).*|\\1\t$F/apps|" \
+       -e '/^kflux\./d' \
+       -e 's/^(session\.screen0\.(toolbar|slit)\.layer:[[:space:]]*)AboveDock/\12/' \
+       -e 's/^(session\.screen0\.(toolbar|slit)\.layer:[[:space:]]*)Dock/\14/' \
+       -e 's/^(session\.screen0\.(toolbar|slit)\.layer:[[:space:]]*)Top/\16/' \
+       -e 's/^(session\.screen0\.(toolbar|slit)\.layer:[[:space:]]*)Normal/\18/' \
+       -e 's/^(session\.screen0\.(toolbar|slit)\.layer:[[:space:]]*)Bottom/\110/' \
+       -e 's/^(session\.screen0\.(toolbar|slit)\.layer:[[:space:]]*)Desktop/\112/' \
+       "$K/init" > "$F/init"
+grep -q '^session\.slitlistFile:' "$F/init" ||
+    printf 'session.slitlistFile:\t%s/slitlist\n' "$F" >> "$F/init"
+
+# startup: the KDE helpers the kflux session starts, minus its Waybar
+# toolbar and slit, swaybg and conky (fluxland draws its own).
+cat > "$F/startup" <<EOF
+#!/bin/sh
+dbus-update-activation-environment --systemd WAYLAND_DISPLAY DISPLAY \\
+    XDG_CURRENT_DESKTOP XDG_SESSION_TYPE QT_QPA_PLATFORMTHEME XDG_MENU_PREFIX \\
+    QT_QUICK_BACKEND KDE_SESSION_VERSION
+mako &
+/usr/lib/polkit-kde-authentication-agent-1 &
+nm-applet --indicator &
+kdeconnect-indicator &
+kbuildsycoca6 --noincremental >/dev/null 2>&1 &
+# slit dockapps: tiny foot windows docked by the [Dock] rule in apps
+foot -a kflux-dock-clock -W 7x1 -o pad=6x4 \\
+    sh -c 'while :; do printf "\\r %s" "\$(date +%H:%M)"; sleep 15; done' &
+foot -a kflux-dock-load -W 7x1 -o pad=6x4 \\
+    sh -c 'while :; do printf "\\r%s" "\$(cut -d" " -f1 /proc/loadavg)"; sleep 5; done' &
+[ -f "$K/startup" ] && sh "$K/startup" &
+EOF
+chmod 755 "$F/startup"
+
+exec fluxland >"$LOG" 2>&1

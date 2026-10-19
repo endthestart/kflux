@@ -1,0 +1,612 @@
+fluxland: port from wlroots 0.18 to wlroots 0.20 (for kflux)
+
+Applies to ecliptik/fluxland 32d1009 (v1.1.0). Same content as the eight commits
+on branch wlroots-0.20 in third_party/fluxland (see docs/upstream/fluxland-pr.md).
+
+Build:
+- meson: depend on wlroots-0.20; drop the include/ directory that upstream
+  references but never committed (setup fails on a clean clone).
+
+API changes (wlroots 0.19 and 0.20 release notes):
+- wlr_xdg_surface_get_geometry() removed: read wlr_xdg_surface.geometry.
+- wlr_presentation_create() takes a protocol version (2).
+- wlr_surface_accepts_tablet_v2() argument order swapped.
+- wlr_xwayland_surface_set_maximized() takes one flag per axis.
+- text-input-v3 / input-method-v2 manager signals renamed to new_text_input /
+  new_input_method.
+- wlr_drm_lease_v1.n_connectors removed (log line only).
+
+Behaviour changes that compile but abort at runtime:
+- No configure may be scheduled before a toplevel's initial commit: set the
+  xdg-decoration mode from the first commit when the client creates the
+  decoration early (every client using xdg-decoration crashed fluxland).
+  Likewise only (de)activate toplevels that are initialized: wlroots resets
+  an xdg surface on unmap, and focusing the next window on close crashed.
+- No listeners may remain on a global's signals when it is destroyed: remove
+  the xwayland, xdg-shell, xdg-decoration and gamma-control listeners before
+  teardown (fluxland aborted on exit).
+
+Fluxbox behaviour fixes found while testing in kflux (not wlroots related):
+- Drag-to-tab: hit-test the drop target with the dragged window hidden; it
+  follows the pointer, so drops only worked onto windows stacked above it.
+  Activate the dropped tab, so keyboard focus is not left on a hidden tab.
+- toolbar.tools: accept Fluxbox's comma-separated list, not only spaces.
+- Icon bar: leave out windows docked in the slit.
+
+Tests: test_rules stubbed the removed geometry getter; set the field instead.
+test_toolbar_layout's wm_view stub gains `docked`.
+The other unit tests stub wlroots 0.18's API and are not ported.
+
+diff --git a/meson.build b/meson.build
+index 0ce5055..9914b78 100644
+--- a/meson.build
++++ b/meson.build
+@@ -79,8 +79,8 @@ endif
+ # --- Core dependencies ---
+ 
+ wlroots = dependency(
+-  'wlroots-0.18',
+-  version: ['>=0.18.0', '<0.19.0'],
++  'wlroots-0.20',
++  version: ['>=0.20.0', '<0.21.0'],
+ )
+ 
+ wayland_server = dependency('wayland-server', version: '>=1.22.0')
+@@ -182,7 +182,7 @@ subdir('protocols')
+ 
+ # --- Include directories ---
+ 
+-wm_inc = include_directories('include', 'src')
++wm_inc = include_directories('src')
+ 
+ # --- Collect sources ---
+ 
+diff --git a/src/cursor.c b/src/cursor.c
+index 9392a36..ac36be5 100644
+--- a/src/cursor.c
++++ b/src/cursor.c
+@@ -206,6 +206,23 @@ process_cursor_resize(struct wm_server *server, uint32_t time)
+ 	}
+ }
+ 
++/*
++ * The window being tabbed follows the pointer, so hit-test with it hidden:
++ * otherwise the pointer always lands on the dragged window itself.
++ */
++static struct wm_view *
++tab_drop_target_at(struct wm_server *server, struct wm_view *dragged)
++{
++	double sx, sy;
++	struct wlr_surface *surface = NULL;
++
++	wlr_scene_node_set_enabled(&dragged->scene_tree->node, false);
++	struct wm_view *target = view_at(server,
++		server->cursor->x, server->cursor->y, &surface, &sx, &sy);
++	wlr_scene_node_set_enabled(&dragged->scene_tree->node, true);
++	return target;
++}
++
+ static void
+ process_cursor_tabbing(struct wm_server *server, uint32_t time)
+ {
+@@ -226,10 +243,7 @@ process_cursor_tabbing(struct wm_server *server, uint32_t time)
+ 		view->x, view->y);
+ 
+ 	/* Find if cursor is over another view's titlebar */
+-	double sx, sy;
+-	struct wlr_surface *surface = NULL;
+-	struct wm_view *target = view_at(server,
+-		server->cursor->x, server->cursor->y, &surface, &sx, &sy);
++	struct wm_view *target = tab_drop_target_at(server, view);
+ 
+ 	if (target && target != view && target->decoration) {
+ 		double dx = server->cursor->x - target->x;
+@@ -543,12 +557,8 @@ handle_cursor_button(struct wl_listener *listener, void *data)
+ 			    server->grabbed_view) {
+ 				struct wm_view *dragged =
+ 					server->grabbed_view;
+-				double sx2, sy2;
+-				struct wlr_surface *surf2 = NULL;
+-				struct wm_view *target = view_at(server,
+-					server->cursor->x,
+-					server->cursor->y,
+-					&surf2, &sx2, &sy2);
++				struct wm_view *target =
++					tab_drop_target_at(server, dragged);
+ 
+ 				if (target && target != dragged &&
+ 				    target->decoration) {
+@@ -575,6 +585,12 @@ handle_cursor_button(struct wl_listener *listener, void *data)
+ 								target->
+ 								tab_group,
+ 								dragged);
++							/* Keep the dropped window
++							 * shown and focused */
++							wm_tab_group_activate(
++								target->
++								tab_group,
++								dragged);
+ 						}
+ 						server->cursor_mode =
+ 							WM_CURSOR_PASSTHROUGH;
+diff --git a/src/decoration.c b/src/decoration.c
+index c682898..37895b0 100644
+--- a/src/decoration.c
++++ b/src/decoration.c
+@@ -387,7 +387,7 @@ wm_decoration_create(struct wm_view *view, struct wm_style *style)
+ 
+ 	/* Get client surface size */
+ 	struct wlr_box geo;
+-	wlr_xdg_surface_get_geometry(view->xdg_toplevel->base, &geo);
++	geo = view->xdg_toplevel->base->geometry;
+ 	deco->content_width = geo.width > 0 ? geo.width : 640;
+ 	deco->content_height = geo.height > 0 ? geo.height : 480;
+ 
+@@ -1486,8 +1486,7 @@ wm_decoration_refresh_geometry(struct wm_decoration *decoration,
+ 	}
+ 
+ 	struct wlr_box geo;
+-	wlr_xdg_surface_get_geometry(decoration->view->xdg_toplevel->base,
+-		&geo);
++	geo = decoration->view->xdg_toplevel->base->geometry;
+ 	if (geo.width > 0 && geo.height > 0 &&
+ 	    (geo.width != decoration->content_width ||
+ 	     geo.height != decoration->content_height)) {
+@@ -1897,18 +1896,45 @@ handle_xdg_decoration_destroy(struct wl_listener *listener, void *data)
+ 		wl_container_of(listener, deco, destroy);
+ 	wl_list_remove(&deco->destroy.link);
+ 	wl_list_remove(&deco->request_mode.link);
++	wl_list_remove(&deco->surface_commit.link);
+ 	free(deco);
+ }
+ 
++/*
++ * Always use server-side decorations. wlroots 0.19+ asserts that no
++ * configure is scheduled before the toplevel's initial commit, so until
++ * then the mode is set from the surface's first commit instead.
++ */
++static void
++xdg_decoration_set_server_side(struct wm_xdg_decoration *deco)
++{
++	if (!deco->wlr_decoration->toplevel->base->initialized)
++		return;
++	wlr_xdg_toplevel_decoration_v1_set_mode(deco->wlr_decoration,
++		WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
++}
++
++static void
++handle_xdg_decoration_surface_commit(struct wl_listener *listener,
++	void *data)
++{
++	struct wm_xdg_decoration *deco =
++		wl_container_of(listener, deco, surface_commit);
++
++	if (!deco->wlr_decoration->toplevel->base->initialized)
++		return;
++	wl_list_remove(&deco->surface_commit.link);
++	wl_list_init(&deco->surface_commit.link);
++	xdg_decoration_set_server_side(deco);
++}
++
+ static void
+ handle_xdg_decoration_request_mode(struct wl_listener *listener, void *data)
+ {
+ 	struct wm_xdg_decoration *deco =
+ 		wl_container_of(listener, deco, request_mode);
+ 
+-	/* Always request server-side decorations */
+-	wlr_xdg_toplevel_decoration_v1_set_mode(deco->wlr_decoration,
+-		WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
++	xdg_decoration_set_server_side(deco);
+ }
+ 
+ static void
+@@ -1933,8 +1959,15 @@ handle_new_xdg_decoration(struct wl_listener *listener, void *data)
+ 	wl_signal_add(&wlr_deco->events.request_mode, &deco->request_mode);
+ 
+ 	/* Set initial mode to server-side */
+-	wlr_xdg_toplevel_decoration_v1_set_mode(wlr_deco,
+-		WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
++	if (wlr_deco->toplevel->base->initialized) {
++		wl_list_init(&deco->surface_commit.link);
++		xdg_decoration_set_server_side(deco);
++	} else {
++		deco->surface_commit.notify =
++			handle_xdg_decoration_surface_commit;
++		wl_signal_add(&wlr_deco->toplevel->base->surface->events.commit,
++			&deco->surface_commit);
++	}
+ }
+ 
+ void
+diff --git a/src/decoration.h b/src/decoration.h
+index f443045..96adf70 100644
+--- a/src/decoration.h
++++ b/src/decoration.h
+@@ -135,6 +135,7 @@ struct wm_xdg_decoration {
+ 	struct wm_server *server;
+ 	struct wl_listener destroy;
+ 	struct wl_listener request_mode;
++	struct wl_listener surface_commit; /* until the toplevel is initialized */
+ };
+ 
+ /* --- API --- */
+diff --git a/src/drm_lease.c b/src/drm_lease.c
+index 712fd12..9c532ce 100644
+--- a/src/drm_lease.c
++++ b/src/drm_lease.c
+@@ -37,8 +37,7 @@ handle_drm_lease_request(struct wl_listener *listener, void *data)
+ 		return;
+ 	}
+ 
+-	wlr_log(WLR_INFO, "drm lease: granted lease with %zu connectors",
+-		lease->n_connectors);
++	wlr_log(WLR_INFO, "%s", "drm lease: granted lease");
+ }
+ 
+ void
+diff --git a/src/placement.c b/src/placement.c
+index 1eea4ca..e7840bf 100644
+--- a/src/placement.c
++++ b/src/placement.c
+@@ -75,7 +75,7 @@ static void
+ view_dims(struct wm_view *view, int *w, int *h)
+ {
+ 	struct wlr_box geo;
+-	wlr_xdg_surface_get_geometry(view->xdg_toplevel->base, &geo);
++	geo = view->xdg_toplevel->base->geometry;
+ 	*w = geo.width > 0 ? geo.width : 200;
+ 	*h = geo.height > 0 ? geo.height : 200;
+ }
+diff --git a/src/presentation.c b/src/presentation.c
+index ffa4069..0efe971 100644
+--- a/src/presentation.c
++++ b/src/presentation.c
+@@ -21,7 +21,7 @@ void
+ wm_presentation_init(struct wm_server *server)
+ {
+ 	server->presentation = wlr_presentation_create(
+-		server->wl_display, server->backend);
++		server->wl_display, server->backend, 2);
+ 	if (!server->presentation) {
+ 		wlr_log(WLR_ERROR, "%s", "failed to create wp-presentation-time");
+ 		return;
+diff --git a/src/rules.c b/src/rules.c
+index 641ea6c..67e602b 100644
+--- a/src/rules.c
++++ b/src/rules.c
+@@ -630,10 +630,7 @@ void wm_rules_apply(struct wm_rules *rules, struct wm_view *view) {
+ 					int vw = 0, vh = 0;
+ 					if (view->xdg_toplevel) {
+ 						struct wlr_box geo;
+-						wlr_xdg_surface_get_geometry(
+-							view->xdg_toplevel
+-							    ->base,
+-							&geo);
++						geo = view->xdg_toplevel->base->geometry;
+ 						vw = geo.width;
+ 						vh = geo.height;
+ 					}
+diff --git a/src/server.c b/src/server.c
+index a475009..e8994c8 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -597,12 +597,29 @@ wm_server_run(struct wm_server *server)
+ 	wl_display_run(server->wl_display);
+ }
+ 
++/* Remove a listener if it was ever added (the server starts zeroed) */
++static void
++remove_listener(struct wl_listener *listener)
++{
++	if (listener->link.next)
++		wl_list_remove(&listener->link);
++}
++
+ void
+ wm_server_destroy(struct wm_server *server)
+ {
+ 	wm_xwayland_finish(server);
+ 	wl_display_destroy_clients(server->wl_display);
+ 
++	/*
++	 * wlroots 0.19+ asserts that no listeners remain on a global's
++	 * signals when wl_display_destroy() tears it down.
++	 */
++	remove_listener(&server->new_xdg_toplevel);
++	remove_listener(&server->new_xdg_popup);
++	remove_listener(&server->new_xdg_decoration);
++	remove_listener(&server->gamma_set_gamma);
++
+ #ifdef WM_HAS_SYSTRAY
+ 	wm_systray_destroy(server->systray);
+ #endif
+diff --git a/src/slit.c b/src/slit.c
+index 9a592cb..4a5181f 100644
+--- a/src/slit.c
++++ b/src/slit.c
+@@ -401,7 +401,7 @@ handle_native_slit_client_commit(struct wl_listener *listener, void *data)
+ 		return;
+ 
+ 	struct wlr_box geo;
+-	wlr_xdg_surface_get_geometry(client->xdg_toplevel->base, &geo);
++	geo = client->xdg_toplevel->base->geometry;
+ 
+ 	int new_w = geo.width > 0 ? geo.width : client->width;
+ 	int new_h = geo.height > 0 ? geo.height : client->height;
+@@ -759,7 +759,7 @@ wm_slit_add_native_client(struct wm_slit *slit,
+ 
+ 	/* Get initial geometry from XDG surface */
+ 	struct wlr_box geo;
+-	wlr_xdg_surface_get_geometry(toplevel->base, &geo);
++	geo = toplevel->base->geometry;
+ 	client->width = geo.width > 0 ? geo.width : 64;
+ 	client->height = geo.height > 0 ? geo.height : 64;
+ 
+diff --git a/src/tabgroup.c b/src/tabgroup.c
+index 6f86f5a..3b4cd35 100644
+--- a/src/tabgroup.c
++++ b/src/tabgroup.c
+@@ -38,7 +38,7 @@ sync_view_to_group(struct wm_tab_group *group, struct wm_view *view)
+ 
+ 	/* Match size */
+ 	struct wlr_box geo;
+-	wlr_xdg_surface_get_geometry(active->xdg_toplevel->base, &geo);
++	geo = active->xdg_toplevel->base->geometry;
+ 	wlr_xdg_toplevel_set_size(view->xdg_toplevel,
+ 		geo.width, geo.height);
+ }
+diff --git a/src/tablet.c b/src/tablet.c
+index 51e6d2c..eb291a5 100644
+--- a/src/tablet.c
++++ b/src/tablet.c
+@@ -164,7 +164,7 @@ handle_tool_axis(struct wl_listener *listener, void *data)
+ 	tablet_view_at(server, lx, ly, &surface, &sx, &sy);
+ 
+ 	if (surface && wlr_surface_accepts_tablet_v2(
+-			tablet->tablet_v2, surface)) {
++			surface, tablet->tablet_v2)) {
+ 		if (tool_v2->focused_surface != surface) {
+ 			wlr_send_tablet_v2_tablet_tool_proximity_in(
+ 				tool_v2, tablet->tablet_v2, surface);
+@@ -246,7 +246,7 @@ handle_tool_proximity(struct wl_listener *listener, void *data)
+ 		&surface, &sx, &sy);
+ 
+ 	if (surface && wlr_surface_accepts_tablet_v2(
+-			tablet->tablet_v2, surface)) {
++			surface, tablet->tablet_v2)) {
+ 		wlr_send_tablet_v2_tablet_tool_proximity_in(
+ 			tool_v2, tablet->tablet_v2, surface);
+ 	}
+diff --git a/src/text_input.c b/src/text_input.c
+index 25f4d59..a606a60 100644
+--- a/src/text_input.c
++++ b/src/text_input.c
+@@ -454,14 +454,14 @@ wm_text_input_init(struct wm_server *server)
+ 		wlr_text_input_manager_v3_create(server->wl_display);
+ 
+ 	relay->new_text_input.notify = handle_new_text_input;
+-	wl_signal_add(&relay->text_input_mgr->events.text_input,
++	wl_signal_add(&relay->text_input_mgr->events.new_text_input,
+ 		&relay->new_text_input);
+ 
+ 	relay->input_method_mgr =
+ 		wlr_input_method_manager_v2_create(server->wl_display);
+ 
+ 	relay->new_input_method.notify = handle_new_input_method;
+-	wl_signal_add(&relay->input_method_mgr->events.input_method,
++	wl_signal_add(&relay->input_method_mgr->events.new_input_method,
+ 		&relay->new_input_method);
+ 
+ 	wlr_log(WLR_INFO, "%s",
+diff --git a/src/toolbar.c b/src/toolbar.c
+index 4ee2e2d..48b4481 100644
+--- a/src/toolbar.c
++++ b/src/toolbar.c
+@@ -100,7 +100,8 @@ parse_toolbar_tools(struct wm_toolbar *toolbar, const char *tools_str)
+ 	int count = 0;
+ 	enum wm_toolbar_tool_type types[WM_TOOLBAR_MAX_TOOLS];
+ 	char *saveptr = NULL;
+-	char *tok = strtok_r(copy, " \t", &saveptr);
++	/* Fluxbox separates tools with commas; accept spaces too */
++	char *tok = strtok_r(copy, " \t,", &saveptr);
+ 	while (tok && count < WM_TOOLBAR_MAX_TOOLS) {
+ 		enum wm_toolbar_tool_type type;
+ 		if (parse_tool_name(tok, &type)) {
+@@ -109,7 +110,7 @@ parse_toolbar_tools(struct wm_toolbar *toolbar, const char *tools_str)
+ 			wlr_log(WLR_INFO,
+ 				"toolbar: unknown tool '%s', skipping", tok);
+ 		}
+-		tok = strtok_r(NULL, " \t", &saveptr);
++		tok = strtok_r(NULL, " \t,", &saveptr);
+ 	}
+ 	free(copy);
+ 
+@@ -480,6 +481,11 @@ collect_iconbar_entries(struct wm_toolbar *toolbar)
+ 			continue;
+ 		}
+ 
++		/* Dockapps live in the slit, not the icon bar */
++		if (view->docked) {
++			continue;
++		}
++
+ 		bool is_iconified = !view->scene_tree->node.enabled;
+ 		bool on_current_ws = (view->workspace == current_ws ||
+ 			view->sticky);
+diff --git a/src/view.c b/src/view.c
+index 91c7521..2a7a992 100644
+--- a/src/view.c
++++ b/src/view.c
+@@ -103,7 +103,7 @@ void
+ wm_view_get_geometry(struct wm_view *view, struct wlr_box *box)
+ {
+ 	struct wlr_box geo;
+-	wlr_xdg_surface_get_geometry(view->xdg_toplevel->base, &geo);
++	geo = view->xdg_toplevel->base->geometry;
+ 	box->x = view->x;
+ 	box->y = view->y;
+ 	box->width = geo.width;
+@@ -149,8 +149,7 @@ wm_view_begin_interactive(struct wm_view *view,
+ 		server->grab_geobox.height = 0;
+ 	} else {
+ 		struct wlr_box geo;
+-		wlr_xdg_surface_get_geometry(view->xdg_toplevel->base,
+-			&geo);
++		geo = view->xdg_toplevel->base->geometry;
+ 
+ 		double border_x = (view->x + geo.x) +
+ 			((edges & WLR_EDGE_RIGHT) ? geo.width : 0);
+diff --git a/src/view_focus.c b/src/view_focus.c
+index 88f2e68..da6c0fe 100644
+--- a/src/view_focus.c
++++ b/src/view_focus.c
+@@ -68,7 +68,7 @@ wm_focus_view(struct wm_view *view, struct wlr_surface *surface)
+ 	if (prev_surface) {
+ 		struct wlr_xdg_toplevel *prev_toplevel =
+ 			wlr_xdg_toplevel_try_from_wlr_surface(prev_surface);
+-		if (prev_toplevel) {
++		if (prev_toplevel && prev_toplevel->base->initialized) {
+ 			wlr_xdg_toplevel_set_activated(prev_toplevel, false);
+ 		}
+ 		/* Update decoration on previously focused view */
+@@ -94,7 +94,8 @@ wm_focus_view(struct wm_view *view, struct wlr_surface *surface)
+ 	wlr_scene_node_raise_to_top(&view->scene_tree->node);
+ 
+ 	/* Activate the new toplevel */
+-	wlr_xdg_toplevel_set_activated(view->xdg_toplevel, true);
++	if (view->xdg_toplevel->base->initialized)
++		wlr_xdg_toplevel_set_activated(view->xdg_toplevel, true);
+ 
+ 	/* Track focused view */
+ 	server->focused_view = view;
+@@ -188,7 +189,7 @@ wm_unfocus_current(struct wm_server *server)
+ 	if (prev_surface) {
+ 		struct wlr_xdg_toplevel *prev_toplevel =
+ 			wlr_xdg_toplevel_try_from_wlr_surface(prev_surface);
+-		if (prev_toplevel) {
++		if (prev_toplevel && prev_toplevel->base->initialized) {
+ 			wlr_xdg_toplevel_set_activated(prev_toplevel, false);
+ 		}
+ 	}
+@@ -366,7 +367,7 @@ wm_focus_update_for_cursor(struct wm_server *server,
+ 			struct wlr_xdg_toplevel *prev_toplevel =
+ 				wlr_xdg_toplevel_try_from_wlr_surface(
+ 					prev_surface);
+-			if (prev_toplevel) {
++			if (prev_toplevel && prev_toplevel->base->initialized) {
+ 				wlr_xdg_toplevel_set_activated(
+ 					prev_toplevel, false);
+ 			}
+@@ -380,7 +381,9 @@ wm_focus_update_for_cursor(struct wm_server *server,
+ 				server->focused_view, false);
+ 		}
+ 
+-		wlr_xdg_toplevel_set_activated(view->xdg_toplevel, true);
++		if (view->xdg_toplevel->base->initialized)
++			wlr_xdg_toplevel_set_activated(
++				view->xdg_toplevel, true);
+ 		server->focused_view = view;
+ 
+ 		/* Apply focus opacity to newly focused view */
+diff --git a/src/xwayland.c b/src/xwayland.c
+index f8bcc8d..bd1622e 100644
+--- a/src/xwayland.c
++++ b/src/xwayland.c
+@@ -180,7 +180,7 @@ xwayland_focus_view(struct wm_xwayland_view *xview)
+ 	if (prev) {
+ 		struct wlr_xdg_toplevel *prev_toplevel =
+ 			wlr_xdg_toplevel_try_from_wlr_surface(prev);
+-		if (prev_toplevel) {
++		if (prev_toplevel && prev_toplevel->base->initialized) {
+ 			wlr_xdg_toplevel_set_activated(prev_toplevel, false);
+ 		}
+ 		/* Deactivate previously focused XWayland surface */
+@@ -534,7 +534,7 @@ handle_xwayland_request_maximize(struct wl_listener *listener, void *data)
+ 	}
+ 
+ 	wlr_xwayland_surface_set_maximized(xview->xsurface,
+-		xview->maximized);
++		xview->maximized, xview->maximized);
+ }
+ 
+ static void
+@@ -847,6 +847,9 @@ void
+ wm_xwayland_finish(struct wm_server *server)
+ {
+ 	if (server->xwayland) {
++		/* wlroots 0.19+ asserts no listeners remain on destroy */
++		wl_list_remove(&server->xwayland_new_surface.link);
++		wl_list_remove(&server->xwayland_ready.link);
+ 		wlr_xwayland_destroy(server->xwayland);
+ 		server->xwayland = NULL;
+ 	}
+diff --git a/tests/fuzz/meson.build b/tests/fuzz/meson.build
+index 717402b..6220ab7 100644
+--- a/tests/fuzz/meson.build
++++ b/tests/fuzz/meson.build
+@@ -5,7 +5,7 @@
+ #   ./fuzz_rcparser tests/fuzz/corpus/rcparser/
+ #   ./fuzz_keybind tests/fuzz/corpus/keybind/
+ 
+-fuzz_inc = include_directories('../../include', '../../src')
++fuzz_inc = include_directories('../../src')
+ 
+ # Check if the compiler supports -fsanitize=fuzzer
+ have_fuzzer = cc.has_argument('-fsanitize=fuzzer')
+diff --git a/tests/meson.build b/tests/meson.build
+index 16eedd9..03eba79 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -1,7 +1,7 @@
+ # Test infrastructure for fluxland
+ # Each test is a standalone executable that returns 0 on success.
+ 
+-test_inc = include_directories('../include', '../src')
++test_inc = include_directories('../src')
+ 
+ # --- test_config: config parser tests ---
+ test_config = executable(
+diff --git a/tests/test_rules.c b/tests/test_rules.c
+index 19bf2bf..3fa58fe 100644
+--- a/tests/test_rules.c
++++ b/tests/test_rules.c
+@@ -62,17 +62,9 @@ wlr_output_layout_get_box(struct wlr_output_layout *layout,
+ 	*box = g_layout_box;
+ }
+ 
+-/* Global controlling what wlr_xdg_surface_get_geometry returns */
++/* Window geometry the view reports (wlroots 0.19+ reads wlr_xdg_surface.geometry) */
+ static struct wlr_box g_xdg_geo = { .x = 0, .y = 0, .width = 200, .height = 150 };
+ 
+-void
+-wlr_xdg_surface_get_geometry(struct wlr_xdg_surface *surface,
+-	struct wlr_box *box)
+-{
+-	(void)surface;
+-	*box = g_xdg_geo;
+-}
+-
+ uint32_t
+ wlr_xdg_toplevel_set_size(struct wlr_xdg_toplevel *toplevel,
+ 	int width, int height)
+@@ -230,6 +222,7 @@ setup_anchor_env(struct wm_view *view)
+ 
+ 	/* Default geometry returned by stub: 200x150 */
+ 	g_xdg_geo = (struct wlr_box){ 0, 0, 200, 150 };
++	s_xdg_surface.geometry = g_xdg_geo;
+ }
+ 
+ /* Test: init/finish lifecycle */
+diff --git a/tests/test_toolbar_layout.c b/tests/test_toolbar_layout.c
+index 0313c81..bbaff39 100644
+--- a/tests/test_toolbar_layout.c
++++ b/tests/test_toolbar_layout.c
+@@ -387,6 +387,7 @@ struct wm_view {
+ 	bool maximized_vert, maximized_horiz;
+ 	bool lhalf, rhalf;
+ 	bool show_decoration;
++	bool docked;
+ 	char *title;
+ 	char *app_id;
+ 	struct wm_workspace *workspace;

@@ -1,0 +1,69 @@
+# kflux PoC package set (CachyOS repos + Arch core/extra)
+# --- base system (CachyOS) ---
+base
+linux-cachyos
+mkinitcpio
+cachyos-settings
+cachyos-keyring
+cachyos-mirrorlist
+sudo
+networkmanager
+openssh
+qemu-guest-agent
+open-vm-tools
+nano
+less
+htop
+python
+# --- session ---
+greetd
+# labwc: replaced by labwc-kflux (labwc + tabs), built by build-image.sh
+xorg-xwayland
+waybar
+swaybg
+swayidle
+swaylock
+mako
+grim
+slurp
+wtype
+libnotify
+wdisplays
+greetd-tuigreet
+plasma-desktop
+wlr-randr
+kanshi
+foot
+conky
+fuzzel
+pipewire
+pipewire-pulse
+wireplumber
+# --- KDE functionality behind it ---
+konsole
+dolphin
+kate
+systemsettings
+krunner
+plasma-nm
+plasma-pa
+kdeconnect
+polkit-kde-agent
+xdg-desktop-portal-kde
+xdg-desktop-portal-wlr
+plasma-integration
+breeze
+breeze-icons
+kde-gtk-config
+kio-extras
+kwallet-pam
+kwalletmanager
+network-manager-applet
+archlinux-xdg-menu
+mesa
+# --- Fluxbox heritage: shipped styles (MIT) and fonts ---
+fluxbox
+ttf-dejavu
+noto-fonts
+terminus-font
+ttf-terminus-nerd

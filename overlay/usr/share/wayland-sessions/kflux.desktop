@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=kflux
+Comment=Fluxbox-style desktop on labwc with KDE apps and services
+Exec=kflux-session
+Type=Application
+DesktopNames=kflux;KDE

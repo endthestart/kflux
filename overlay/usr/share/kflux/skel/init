@@ -1,0 +1,46 @@
+! kflux init -- Fluxbox init(5) resources, plus a few kflux.* extras.
+! Edit, then "Reconfigure" from the root menu, or run `kflux reconfigure`.
+
+session.styleFile:	/usr/share/kflux/styles/kflux-Carbon
+session.menuFile:	~/.config/kflux/menu
+session.keyFile:	~/.config/kflux/keys
+session.appsFile:	~/.config/kflux/apps
+session.screen0.windowMenu:	~/.config/kflux/windowmenu
+
+! workspaces
+session.screen0.workspaces:	4
+session.screen0.workspaceNames:	one,two,three,four,
+
+! focus: ClickFocus | MouseFocus | StrictMouseFocus
+session.screen0.focusModel:	ClickFocus
+session.screen0.autoRaise:	true
+session.screen0.windowPlacement:	RowSmartPlacement
+session.screen0.edgeSnapThreshold:	10
+
+! titlebar buttons: Stick Shade Minimize Maximize Close MenuIcon
+session.screen0.titlebar.left:	Stick
+session.screen0.titlebar.right:	Shade Minimize Maximize Close
+
+! toolbar
+session.screen0.toolbar.visible:	true
+session.screen0.toolbar.placement:	BottomCenter
+session.screen0.toolbar.widthPercent:	100
+session.screen0.toolbar.height:	0
+session.screen0.toolbar.layer:	Dock
+session.screen0.toolbar.tools:	prevworkspace, workspacename, nextworkspace, iconbar, systemtray, clock
+session.screen0.strftimeFormat:	%a %d %b  %H:%M
+
+! slit (dockapps are listed in ~/.config/kflux/slitlist)
+session.screen0.slit.placement:	RightBottom
+
+! kflux extras
+kflux.terminal:	konsole
+kflux.runner:	krunner
+kflux.editor:	kate
+kflux.slit.visible:	true
+kflux.conky:	true
+kflux.conky.alignment:	bottom_left
+kflux.terminalFont:	Terminess Nerd Font,10
+kflux.lockAfterMinutes:	0
+kflux.keyboardLayout:	us
+kflux.wallpaper:	

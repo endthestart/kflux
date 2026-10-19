@@ -1,0 +1,107 @@
+! kflux-Carbon -- an original Fluxbox style for kflux, in the spirit of the
+! dark, bevelled, bitmap-font desktops of 2004-2008.
+! Copyright (c) 2026 kflux contributors. MIT licence (same terms as Fluxbox).
+
+style.name:		kflux-Carbon
+style.author:		kflux
+
+*.font:			terminus-9
+*.justify:		center
+borderWidth:		1
+borderColor:		#0b0d10
+bevelWidth:		1
+handleWidth:		4
+
+background:		gradient
+background.color:	#1b2026
+background.colorTo:	#0a0c0f
+
+! ---- toolbar
+toolbar:			Raised Gradient Vertical Bevel1
+toolbar.color:			#3a4048
+toolbar.colorTo:		#1c2026
+toolbar.textColor:		#c8d0d8
+toolbar.borderWidth:		1
+toolbar.borderColor:		#0b0d10
+toolbar.workspace:		Sunken Gradient Vertical
+toolbar.workspace.color:	#14181d
+toolbar.workspace.colorTo:	#262c33
+toolbar.workspace.textColor:	#8fc1ff
+toolbar.button:			Raised Gradient Diagonal Bevel1
+toolbar.button.color:		#4a525c
+toolbar.button.colorTo:		#22272d
+toolbar.button.picColor:	#c8d0d8
+toolbar.iconbar.empty:		ParentRelative
+toolbar.iconbar.focused:	Sunken Gradient Vertical Interlaced
+toolbar.iconbar.focused.color:	#2d4f73
+toolbar.iconbar.focused.colorTo:	#1a3047
+toolbar.iconbar.focused.textColor:	#ffffff
+toolbar.iconbar.unfocused:	Raised Gradient Vertical
+toolbar.iconbar.unfocused.color:	#353b43
+toolbar.iconbar.unfocused.colorTo:	#22272d
+toolbar.iconbar.unfocused.textColor:	#9aa4ae
+toolbar.clock:			Sunken Gradient Vertical
+toolbar.clock.color:		#14181d
+toolbar.clock.colorTo:		#262c33
+toolbar.clock.textColor:	#8fc1ff
+
+! ---- slit
+slit:				Raised Gradient Vertical Bevel1
+slit.color:			#3a4048
+slit.colorTo:			#1c2026
+
+! ---- windows
+window.title.focus:		Raised Gradient Vertical Bevel1
+window.title.focus.color:	#41607f
+window.title.focus.colorTo:	#1f3147
+window.title.unfocus:		Raised Gradient Vertical Bevel1
+window.title.unfocus.color:	#3a4048
+window.title.unfocus.colorTo:	#22272d
+window.label.focus:		ParentRelative
+window.label.focus.textColor:	#ffffff
+window.label.unfocus:		ParentRelative
+window.label.unfocus.textColor:	#8a949e
+window.button.focus:		Raised Gradient Diagonal Bevel1
+window.button.focus.color:	#5a7899
+window.button.focus.colorTo:	#253a52
+window.button.focus.picColor:	#e8eef4
+window.button.unfocus:		Raised Gradient Diagonal Bevel1
+window.button.unfocus.color:	#4a525c
+window.button.unfocus.colorTo:	#22272d
+window.button.unfocus.picColor:	#8a949e
+window.button.pressed:		Sunken Gradient Diagonal
+window.button.pressed.color:	#1f3147
+window.button.pressed.colorTo:	#41607f
+window.handle.focus:		Raised Gradient Vertical
+window.handle.focus.color:	#41607f
+window.handle.focus.colorTo:	#1f3147
+window.handle.unfocus:		Flat Solid
+window.handle.unfocus.color:	#2a2f36
+window.grip.focus:		Raised Gradient Vertical
+window.grip.focus.color:	#5a7899
+window.grip.focus.colorTo:	#253a52
+window.grip.unfocus:		Flat Solid
+window.grip.unfocus.color:	#2a2f36
+window.frame.focusColor:	#0b0d10
+window.frame.unfocusColor:	#0b0d10
+window.font:			terminus-9:bold
+
+! ---- menus
+menu.title:			Raised Gradient Vertical Bevel1
+menu.title.color:		#41607f
+menu.title.colorTo:		#1f3147
+menu.title.textColor:		#ffffff
+menu.title.font:		terminus-9:bold
+menu.frame:			Flat Gradient Vertical
+menu.frame.color:		#2a2f36
+menu.frame.colorTo:		#1c2026
+menu.frame.textColor:		#c8d0d8
+menu.frame.disableColor:	#5f6872
+menu.hilite:			Raised Gradient Vertical Interlaced
+menu.hilite.color:		#4f7aa6
+menu.hilite.colorTo:		#2d4f73
+menu.hilite.textColor:		#ffffff
+menu.bullet:			triangle
+menu.bullet.position:		right
+menu.borderWidth:		1
+menu.borderColor:		#0b0d10
