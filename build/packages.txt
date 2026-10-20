@@ -10,7 +10,6 @@ sudo
 networkmanager
 openssh
 qemu-guest-agent
-open-vm-tools
 nano
 less
 htop

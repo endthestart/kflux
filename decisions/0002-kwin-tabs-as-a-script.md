@@ -17,7 +17,7 @@ requirement, and then propose it upstream rather than carrying a fork.
 
 ## What the spike showed
 
-Tested on KWin 6.8.0 (CachyOS) in a Plasma Wayland session, in a VMware VM
+Tested on KWin 6.8.0 (CachyOS) in a Plasma Wayland session, in a VM
 on an Intel Mac with software rendering. The script and its screenshots were
 left out of the public repository when this record was deprecated.
 

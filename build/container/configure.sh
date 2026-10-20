@@ -43,8 +43,6 @@ EOF
 
 # --- services ----------------------------------------------------------------
 systemctl enable NetworkManager sshd greetd systemd-timesyncd >/dev/null 2>&1
-# VMware guests (build/run-vmware.sh); no-op elsewhere.
-systemctl enable vmtoolsd >/dev/null 2>&1 || true
 
 # Branding: CachyOS repos and kernel, kflux desktop.
 cat > /etc/os-release <<'OSR'

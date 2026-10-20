@@ -187,9 +187,9 @@ Dev loop, against the running VM:
 - `build/fluxland-dev-push.sh` rebuilds fluxland in a `kflux-fluxland-dev` container and installs it into the running VM. Apply the patch to `third_party/fluxland` first; the script's header has the steps.
 - `build/fluxland-uitests.sh` runs fluxland's own pytest UI suite inside the VM, against a nested headless fluxland.
 
-On an Intel Mac with VMware Fusion, reachable over ssh,
-`KFLUX_VMWARE_HOST=host build/run-vmware.sh start|ip|ssh|shot|stop` runs the
-image natively: 2 vCPU, 8 GiB, 3D off. The script's header lists its guards.
+On a Linux host with `/dev/kvm`, `build/run-vm.sh` uses KVM and runs the image
+at native speed. Elsewhere it falls back to QEMU's software emulation (TCG).
+Build and test use open-source tools only: QEMU, OVMF and pacstrap.
 
 ## Layout
 
