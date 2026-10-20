@@ -1,56 +1,151 @@
 # Releasing kflux
 
-Status: the repository is github.com/endthestart/kflux. 0.1.0 is the first
-tag. kflux and labwc-kflux aren't in the AUR yet.
+Versioning and the support window: [ADR 0008](adr/0008-versioning-and-support.md).
+Two packages ship from each release: `kflux` (MIT, `arch=any`) and the optional
+`labwc-kflux` (GPL-2.0-only), both in the AUR. `labwc-kflux`'s `pkgver`
+follows labwc; its `_kfluxver` names the kflux release whose tarball carries
+the patch.
 
-## Repository hygiene
+## The release key
 
-1. **Not tracked.** `.gitignore` covers `.cache/`, `vm/`,
-   `third_party/fluxland/` (the 73 MB upstream checkout; the fluxland-kflux
-   PKGBUILD fetches fluxland by pinned commit) and `docs/upstream/` (unposted
-   upstream drafts). `packaging/make-dist.sh` leaves the same paths out.
-2. **Name.** "kflux" was chosen on 2026-10-19 ([research/naming.md](../research/naming.md)). USPTO and TMview (EU, UK and other offices) were searched on 2026-10-19: no KFLUX mark, with UK KFluxMod as the nearest (see naming.md). Re-run both searches just before the first release, since filings change.
-3. **Licences.** kflux is MIT ([LICENSE](../LICENSE)). The Fluxbox-derived
-   defaults keep Fluxbox's MIT notice
-   ([LICENSES/Fluxbox-MIT.txt](../LICENSES/Fluxbox-MIT.txt)). No CC BY-SA
-   style is bundled; see [NOTICE.md](../NOTICE.md). fluxland, if vendored,
-   keeps its own MIT LICENSE under `third_party/`. `third_party/patches/labwc-tabs.patch`
-   modifies labwc and is GPL-2.0-only, like labwc.
-4. **Clean-room check.** The repo holds no copied screenshots or art from
-   other people. Research links point outward.
+Tags and tarballs are signed with the kflux release key
+([ADR 0009](adr/0009-release-signing-key.md)):
+
+```
+KFLUX_RELEASE_KEY_FPR
+```
+
+The public key is [kflux-release-key.asc](kflux-release-key.asc) and on
+keys.openpgp.org. To verify a release:
+
+```bash
+gpg --recv-keys KFLUX_RELEASE_KEY_FPR
+gpg --verify kflux-X.Y.Z.tar.gz.sig kflux-X.Y.Z.tar.gz
+sha256sum -c SHA256SUMS
+git tag -v vX.Y.Z
+```
+
+## Calendar
+
+For a minor release (X.Y.0):
+
+| When | What |
+|---|---|
+| 3 weeks before | **Feature freeze.** Only bug fixes, docs and translations land. |
+| 2 weeks before | **String freeze**, once kflux has translations. |
+| 1 week before | **Code freeze.** Only release-blocking fixes. Test on real hardware. |
+| release day | the steps below |
+
+Patch releases (X.Y.Z) skip the freezes; they carry bug fixes only, or
+security fixes for the previous minor. When the previous minor needs a fix
+after its successor ships, branch `release-X.Y` from its last tag.
 
 ## Cutting a release
 
-1. Set `VERSION` in `overlay/usr/bin/kflux`, set `pkgver` in both PKGBUILDs, and tag `vX.Y.Z`.
-2. Push the tag. GitHub serves `archive/refs/tags/vX.Y.Z.tar.gz`, the tarball the PKGBUILDs fetch.
-3. In `packaging/arch/kflux/` and `packaging/arch/labwc-kflux/` (1.0 ships kflux and labwc-kflux. fluxland-kflux is parked; see decisions/0003 and 0004). labwc-kflux's `pkgver` follows labwc, not kflux: bump `_kfluxver` there, and rebase `labwc-tabs.patch` whenever CachyOS moves to a new labwc:
-   - run `updpkgsums`, which replaces the `SKIP` checksum
-   - run `makepkg -f`
-   - run `namcap PKGBUILD *.pkg.tar.zst`
-   - run `makepkg --printsrcinfo > .SRCINFO`
-4. AUR: clone `ssh://aur@aur.archlinux.org/kflux.git` and `.../labwc-kflux.git`. Copy `PKGBUILD` and `.SRCINFO` into each, commit and push.
+Replace `X.Y.Z` throughout.
 
-## Testing a package locally (no release needed)
+### 1. Prepare
+
+1. `VERSION` in `src/kflux`.
+2. `pkgver` in `packaging/arch/kflux/PKGBUILD`, and `pkgrel=1`.
+3. If the tabs patch changed: `_kfluxver` in `packaging/arch/labwc-kflux/PKGBUILD`,
+   and bump its `pkgrel` (or set `pkgver` and `pkgrel=1` on a new labwc).
+4. CHANGELOG.md: rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`, add a
+   new empty `## [Unreleased]`, and update the compare links at the bottom.
+
+### 2. Test
+
+1. `make check`.
+2. The packages, from a working-tree tarball, in a clean Arch or CachyOS
+   environment (the kflux Colima profile's `cachyos/cachyos` container works):
+
+   ```bash
+   packaging/make-dist.sh X.Y.Z            # .cache/dist/kflux-X.Y.Z.tar.gz
+   # in packaging/arch/kflux/, with the tarball and an empty .sig copied in:
+   makepkg -f --skipinteg && namcap PKGBUILD kflux-*.pkg.tar.zst
+   ```
+
+   Install the package with `pacman -U` on stock labwc: only the hard
+   dependencies should come in, `kflux doctor` should report every
+   `required:` line ok, and `kflux warnings` should list only the tab
+   bindings.
+3. The test image: `tools/build.sh`, `tools/run-vm.sh --headless`, then
+   `tools/verify.sh` must report 0 failures. It builds `labwc-kflux` from its
+   PKGBUILD.
+4. For a minor release, the owner's real-hardware checklist: SDDM login,
+   multiple monitors and HiDPI, suspend and resume, the lock screen, network,
+   audio and Bluetooth, a style switch, and tabs with `labwc-kflux`.
+
+### 3. Commit and tag
 
 ```bash
-packaging/make-dist.sh 0.1.0
+git commit -s -am "kflux X.Y.Z"
+git tag -s vX.Y.Z -m "kflux X.Y.Z"
+git tag -v vX.Y.Z
 ```
 
-Then, on any Arch or CachyOS machine:
+`git config user.signingkey KFLUX_RELEASE_KEY_FPR` in this repository makes
+`-s` use the release key.
+
+### 4. Build and sign the release files
 
 ```bash
-cd packaging/arch/kflux && KFLUX_SRC=file:///path/to/kflux-0.1.0.tar.gz makepkg -fi
+packaging/make-dist.sh X.Y.Z vX.Y.Z .cache/release
+cd .cache/release
+gpg --local-user KFLUX_RELEASE_KEY_FPR --detach-sign kflux-X.Y.Z.tar.gz
+shasum -a 256 kflux-X.Y.Z.tar.gz kflux-X.Y.Z.tar.gz.sig > SHA256SUMS
+gpg --verify kflux-X.Y.Z.tar.gz.sig kflux-X.Y.Z.tar.gz
 ```
 
-Both packages were built and installed this way in a CachyOS VM on
-2026-10-19. A fresh login then went through the first-run path:
+`make-dist.sh` uses `git archive` and `gzip -n`, so the same tag always gives
+the same tarball. Paths marked `export-ignore` in `.gitattributes` are left
+out.
 
-- the default config was seeded
-- the welcome notification showed
-- `kflux doctor` reported all checks ok
+### 5. Publish
 
-## CachyOS repository (later)
+1. `git push origin main vX.Y.Z`
+2. The GitHub Release, with the changelog section as its notes:
 
-Once the AUR packages have users, ask CachyOS to carry `kflux` in
-the `cachyos` repo. A kflux entry in CachyOS's installer
-desktop list would follow from that.
+   ```bash
+   awk '/^## \[X.Y.Z\]/{f=1;next} /^## \[/{f=0} f' CHANGELOG.md > .cache/release/notes.md
+   gh release create vX.Y.Z --verify-tag --title "kflux X.Y.Z" \
+     --notes-file .cache/release/notes.md \
+     .cache/release/kflux-X.Y.Z.tar.gz .cache/release/kflux-X.Y.Z.tar.gz.sig \
+     .cache/release/SHA256SUMS
+   ```
+
+3. Download the assets back and check them: `shasum -a 256 -c SHA256SUMS`
+   and `gpg --verify`.
+
+### 6. Packages
+
+In each of `packaging/arch/kflux/` and `packaging/arch/labwc-kflux/` (if it
+changed), in an Arch environment:
+
+1. `updpkgsums` (fetches the release tarball and records its sum)
+2. `makepkg -f` (verifies the signature against `validpgpkeys`), then
+   `namcap PKGBUILD *.pkg.tar.zst`
+3. `makepkg --printsrcinfo > .SRCINFO`
+4. Commit the PKGBUILD and `.SRCINFO` changes here, then push.
+
+Then the AUR, for each package:
+
+```bash
+git clone ssh://aur@aur.archlinux.org/kflux.git aur-kflux
+cp packaging/arch/kflux/{PKGBUILD,.SRCINFO} aur-kflux/
+mkdir -p aur-kflux/keys/pgp && cp docs/kflux-release-key.asc aur-kflux/keys/pgp/KFLUX_RELEASE_KEY_FPR.asc
+cd aur-kflux && git add -A && git commit -m "Update to X.Y.Z" && git push
+```
+
+### 7. Announce
+
+- Once the AUR packages have had two clean releases, ask the CachyOS team to
+  carry them; after that, tell the CachyOS packagers about each release.
+- A short post with the release notes on the website. 1.0 is announced on the
+  CachyOS forum, r/unixporn and the Arch forums' Community Contributions board.
+
+## Later
+
+- GitHub artifact attestations for the release files, once release CI exists.
+- Before 1.0, re-run the USPTO and TMview searches for KFLUX (last run
+  2026-10-19: no conflicting mark).

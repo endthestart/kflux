@@ -1,10 +1,8 @@
-# Maintainer: kflux contributors
+# Maintainer: Michael Anderson <1427851+endthestart@users.noreply.github.com>
 # labwc with Fluxbox-style window tabs: upstream labwc plus kflux's
-# patches/labwc-tabs.patch (docs/labwc-kflux.md).
-# Replaces the labwc package; tracks upstream labwc releases (pkgver).
-# Before publishing: tag v$_kfluxver, replace the kflux sha256sum.
-# Local test: KFLUX_SRC=file:///path/kflux.tar.gz makepkg -f
-# tools/container/build-image.sh builds the image's copy this way.
+# patches/labwc-tabs.patch, taken from the signed kflux release tarball.
+# Design and rebasing: docs/labwc-kflux.md in the kflux repository.
+# pkgver follows labwc; _kfluxver is the kflux release that carries the patch.
 _owner=endthestart
 pkgname=labwc-kflux
 pkgver=0.20.2
@@ -26,12 +24,12 @@ optdepends=(
 )
 provides=("labwc=${pkgver}")
 conflicts=('labwc')
-_labwc_src="${LABWC_SRC:-https://github.com/labwc/labwc/archive/refs/tags/${pkgver}.tar.gz}"
-_kflux_src="${KFLUX_SRC:-https://github.com/${_owner}/kflux/archive/refs/tags/v${_kfluxver}.tar.gz}"
-source=("labwc-${pkgver}.tar.gz::${_labwc_src}"
-        "kflux-${_kfluxver}.tar.gz::${_kflux_src}")
+source=("labwc-${pkgver}.tar.gz::https://github.com/labwc/labwc/archive/refs/tags/${pkgver}.tar.gz"
+        "https://github.com/${_owner}/kflux/releases/download/v${_kfluxver}/kflux-${_kfluxver}.tar.gz"{,.sig})
 sha256sums=('fae023b6fe022f7057556707a17cdb2d98e0138c5dffaedaa1dade975699f9e8'
+            'SKIP'
             'SKIP')
+validpgpkeys=('KFLUX_RELEASE_KEY_FPR') # kflux release key
 
 prepare() {
   cd "labwc-${pkgver}"

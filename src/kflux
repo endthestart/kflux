@@ -2520,6 +2520,11 @@ def doctor():
                      ("conky", "desktop stats"), ("swaylock", "screen lock"),
                      ("notify-send", "notifications")):
         line("ok" if shutil.which(cmd) else "warn", "optional: %s (%s)" % (cmd, why))
+    for path, what in (("/usr/lib/qt6/plugins/platformthemes/KDEPlasmaPlatformTheme6.so",
+                        "plasma-integration (KDE colours and dialogs for Qt apps)"),
+                       ("/usr/lib/polkit-kde-authentication-agent-1",
+                        "polkit-kde-agent (password prompts)")):
+        line("ok" if os.path.exists(path) else "warn", "optional: %s" % what)
     if not os.path.isdir(FLUXBOX_STYLES):
         line("warn", "classic styles missing: install the 'fluxbox' package for %s" % FLUXBOX_STYLES)
     for f in ("init", "keys", "apps", "menu"):
