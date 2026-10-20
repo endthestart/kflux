@@ -1,0 +1,5 @@
+# Left out of release tarballs (packaging/make-dist.sh, git archive).
+/.github                         export-ignore
+/.gitattributes                  export-ignore
+/docs/images                     export-ignore
+/experimental/fluxland/screenshots export-ignore

@@ -4,9 +4,9 @@ kflux is MIT-licensed ([LICENSE](LICENSE)). It includes or derives from:
 
 | What | From | Licence | Notes |
 |---|---|---|---|
-| `overlay/usr/share/kflux/skel/keys`, and the menu, windowmenu and init formats and defaults | Fluxbox 1.3.7 `data/keys`, `data/windowmenu`, `data/init.in` | MIT, © 2001–2011 The Fluxbox Team; Blackbox portions © 1997–2000 Brad Hughes | Full text: [LICENSES/Fluxbox-MIT.txt](LICENSES/Fluxbox-MIT.txt) |
-| `third_party/patches/fluxland-wlroots-0.20.patch`, and the `fluxland-kflux` package built from it | [ecliptik/fluxland](https://github.com/ecliptik/fluxland) at commit `32d1009` | MIT, © the fluxland authors | The package installs fluxland's LICENSE. The patch is offered under the same MIT terms. `third_party/fluxland/` is a local upstream checkout and is not part of the kflux repo |
-| `third_party/patches/labwc-tabs.patch`, and the `labwc-kflux` package built from it | [labwc](https://github.com/labwc/labwc) 0.20.2 | **GPL-2.0-only**, © the labwc authors | The patch modifies labwc and is offered under labwc's GPL-2.0-only, not kflux's MIT. The package is labwc plus the patch |
+| `data/skel/keys`, and the menu, windowmenu and init formats and defaults | Fluxbox 1.3.7 `data/keys`, `data/windowmenu`, `data/init.in` | MIT, © 2001–2011 The Fluxbox Team; Blackbox portions © 1997–2000 Brad Hughes | Full text: [LICENSES/Fluxbox-MIT.txt](LICENSES/Fluxbox-MIT.txt) |
+| `experimental/fluxland/fluxland-wlroots-0.20.patch`, and the parked `fluxland-kflux` package built from it | [ecliptik/fluxland](https://github.com/ecliptik/fluxland) at commit `32d1009` | MIT, © the fluxland authors | The package installs fluxland's LICENSE. The patch is offered under the same MIT terms. `experimental/fluxland/upstream/` is a local upstream checkout and is not part of the kflux repo |
+| `patches/labwc-tabs.patch`, and the `labwc-kflux` package built from it | [labwc](https://github.com/labwc/labwc) 0.20.2 | **GPL-2.0-only**, © the labwc authors | The patch modifies labwc and is offered under labwc's GPL-2.0-only, not kflux's MIT. Full text: [LICENSES/GPL-2.0-only.txt](LICENSES/GPL-2.0-only.txt). The package is labwc plus the patch |
 
 Used at runtime but **not** included. They're installed from distribution
 packages and converted on the user's machine:

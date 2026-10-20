@@ -38,5 +38,5 @@ sha256sums=('SKIP')
 
 package() {
   cd "kflux-${pkgver}"
-  make DESTDIR="$pkgdir" PREFIX=/usr install-kflux
+  make DESTDIR="$pkgdir" PREFIX=/usr install
 }

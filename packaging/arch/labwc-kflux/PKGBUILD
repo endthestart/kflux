@@ -1,10 +1,10 @@
 # Maintainer: kflux contributors
 # labwc with Fluxbox-style window tabs: upstream labwc plus kflux's
-# third_party/patches/labwc-tabs.patch (decisions/0004-tabs-in-labwc.md).
+# patches/labwc-tabs.patch (docs/labwc-kflux.md).
 # Replaces the labwc package; tracks upstream labwc releases (pkgver).
 # Before publishing: tag v$_kfluxver, replace the kflux sha256sum.
 # Local test: KFLUX_SRC=file:///path/kflux.tar.gz makepkg -f
-# build/container/build-image.sh builds the image's copy this way.
+# tools/container/build-image.sh builds the image's copy this way.
 _owner=endthestart
 pkgname=labwc-kflux
 pkgver=0.20.2
@@ -35,7 +35,7 @@ sha256sums=('fae023b6fe022f7057556707a17cdb2d98e0138c5dffaedaa1dade975699f9e8'
 
 prepare() {
   cd "labwc-${pkgver}"
-  patch -Np1 -i "../kflux-${_kfluxver}/third_party/patches/labwc-tabs.patch"
+  patch -Np1 -i "../kflux-${_kfluxver}/patches/labwc-tabs.patch"
 }
 
 build() {
