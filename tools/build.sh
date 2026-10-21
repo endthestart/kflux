@@ -3,7 +3,8 @@
 #   tools/build.sh [--with-fluxland]   also build the experimental fluxland session
 #
 # The x86_64 rootfs is assembled inside an amd64 CachyOS container running on
-# the dedicated "kflux" Colima profile (Apple Silicon + Rosetta), then turned
+# the dedicated "kflux" Colima profile (Rosetta on Apple Silicon, native on
+# Intel; size it with KFLUX_COLIMA_CPUS and KFLUX_COLIMA_MEM), then turned
 # into a bootable GPT/UEFI disk without loop devices. See README.md.
 set -euo pipefail
 
@@ -17,11 +18,18 @@ log() { printf '\033[1;34m[kflux]\033[0m %s\n' "$*"; }
 
 ensure_colima() {
   if ! colima status "$PROFILE" >/dev/null 2>&1; then
-    log "starting Colima profile '$PROFILE' (4 vCPU, 4 GiB, Rosetta)"
+    local cpus="${KFLUX_COLIMA_CPUS:-4}" mem="${KFLUX_COLIMA_MEM:-4}" arch=()
+    # Apple Silicon runs the amd64 container under Rosetta; Intel Macs run it natively.
+    if [[ "$(uname -m)" == arm64 ]]; then
+      arch=(--vz-rosetta --arch aarch64)
+    else
+      arch=(--arch x86_64)
+    fi
+    log "starting Colima profile '$PROFILE' ($cpus vCPU, $mem GiB, ${arch[*]})"
     # Starting a profile switches the global docker context; restore it after.
     local prev; prev="$(docker context show 2>/dev/null || echo default)"
-    colima start "$PROFILE" --vm-type vz --vz-rosetta --arch aarch64 \
-      --cpu 4 --memory 4 --disk 30 --runtime docker
+    colima start "$PROFILE" --vm-type vz "${arch[@]}" \
+      --cpu "$cpus" --memory "$mem" --disk 30 --runtime docker
     docker context use "$prev" >/dev/null
   fi
 }

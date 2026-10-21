@@ -23,9 +23,10 @@ byte-compiles the translator and syntax-checks the shell scripts.
 ## The test image
 
 `tools/build.sh` builds a CachyOS disk image with kflux and labwc-kflux
-installed, for QEMU. It runs on macOS (Apple Silicon) with Homebrew `colima`,
-`docker` and `qemu`. The build uses its own Colima profile, `kflux` (4 vCPU,
-4 GiB), and stops it afterwards. Inside an amd64 `cachyos/cachyos` container
+installed, for QEMU. It runs on macOS, Apple Silicon or Intel, with Homebrew
+`colima`, `docker` and `qemu`. The build uses its own Colima profile, `kflux`
+(4 vCPU and 4 GiB; set `KFLUX_COLIMA_CPUS` and `KFLUX_COLIMA_MEM` before the
+profile is first created), and stops it afterwards. Inside an amd64 `cachyos/cachyos` container
 it:
 
 1. pacstraps the packages in [tools/packages.txt](../tools/packages.txt)
