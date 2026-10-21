@@ -1,0 +1,56 @@
+name: Bug report
+description: Something in kflux doesn't work as it should.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Pick the Artwiz style from the root menu
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `kflux doctor`
+      description: Run it inside your kflux session.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: warnings
+    attributes:
+      label: Output of `kflux warnings`
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution
+      placeholder: CachyOS, Arch Linux, ...
+    validations:
+      required: true
+  - type: dropdown
+    id: labwc
+    attributes:
+      label: Compositor package
+      options:
+        - labwc (stock)
+        - labwc-kflux (with tabs)
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: The relevant part of your ~/.config/kflux files, screenshots, logs from ~/.cache/kflux/.

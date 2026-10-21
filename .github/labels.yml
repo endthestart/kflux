@@ -1,0 +1,19 @@
+# kflux's issue labels. Apply with gh (creates or updates each):
+#   awk '/^- name:/{n=substr($0,9)} /^  color:/{c=$2}
+#        /^  description:/{print n"|"c"|"substr($0,16)}' .github/labels.yml |
+#   while IFS='|' read -r n c d; do gh label create "$n" -c "$c" -d "$d" --force; done
+- name: bug
+  color: d73a4a
+  description: Something doesn't work
+- name: enhancement
+  color: a2eeef
+  description: A new feature or improvement
+- name: needs-info
+  color: fbca04
+  description: Waiting on the reporter; closed after 30 days without a reply
+- name: upstream
+  color: c5def5
+  description: The cause is in labwc, Waybar or KDE
+- name: good first issue
+  color: 7057ff
+  description: A good place to start contributing

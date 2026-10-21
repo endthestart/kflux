@@ -1,0 +1,34 @@
+name: Style or theme problem
+description: A Fluxbox style renders wrongly in kflux.
+labels: [bug]
+body:
+  - type: input
+    id: style
+    attributes:
+      label: Style
+      description: Its name, and where it comes from if it isn't one of Fluxbox's shipped styles (a link, or attach it).
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What looks wrong
+      description: Which part (titlebar, toolbar, slit, menu, KDE apps, wallpaper) and how. Screenshots help; one from Fluxbox for comparison helps most.
+    validations:
+      required: true
+  - type: textarea
+    id: warnings
+    attributes:
+      label: Output of `kflux warnings`
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: labwc
+    attributes:
+      label: Compositor package
+      options:
+        - labwc (stock)
+        - labwc-kflux (with tabs)
+    validations:
+      required: true
