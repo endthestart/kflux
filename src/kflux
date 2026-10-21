@@ -42,7 +42,7 @@ KFLUX = os.path.join(XDG_CONFIG, "kflux")
 SYSTEM = os.environ.get("KFLUX_SYSTEM", "/usr/share/kflux")
 FLUXBOX_STYLES = os.environ.get("KFLUX_FLUXBOX_STYLES", "/usr/share/fluxbox/styles")
 GEN_THEME = "kflux-current"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 STYLE_DIRS = [os.path.join(KFLUX, "styles"), os.path.join(SYSTEM, "styles"), FLUXBOX_STYLES]
 WARNINGS = []
 

@@ -2,7 +2,7 @@
 # Release procedure: docs/RELEASING.md in the kflux repository.
 _owner=endthestart
 pkgname=kflux
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="A Fluxbox-style desktop for KDE apps on Wayland"
 arch=('any')
